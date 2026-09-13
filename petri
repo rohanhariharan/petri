@@ -479,6 +479,93 @@ def _same_container_type(x, y):
     return x.get("type") in ("list", "dict") and x.get("type") == y.get("type")
 
 
+def _final_numeric(snap):
+    """Return (float value, kind) for numeric leaf snapshots, else None."""
+    if snap is None:
+        return None
+    v = snap.get("v")
+    if not isinstance(v, dict):
+        return None
+    if v.get("type") in ("int", "float"):
+        try:
+            return float(v["value"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def cfu_metrics(hist_a, hist_b):
+    """Numeric change metrics between two value histories.
+
+    Returns dict with:
+      events  - total value changes recorded across both runs (colony-forming units)
+      changes - count of positions that differ (gram of the change)
+      delta   - (final_a - final_b) for numeric leaf, else None
+      pct     - percent change if numeric and base != 0, else None
+      status  - changed | unchanged | added | removed
+    """
+    a = hist_a or []
+    b = hist_b or []
+    events = len(a) + len(b)
+    if not a or not b:
+        status = "removed" if a and not b else ("added" if not a and b else "unchanged")
+        # a variable present in only one run counts as one discrete change
+        changes = 1 if status in ("added", "removed") else 0
+        return {"events": events, "changes": changes, "delta": None, "pct": None,
+                "status": status}
+    diff_lines, status = diff_histories(a, b)
+    changes = len(diff_lines)
+    fa = _final_numeric(a[-1])
+    fb = _final_numeric(b[-1])
+    delta = pct = None
+    if fa is not None and fb is not None:
+        delta = fb - fa
+        if abs(fa) > 1e-12:
+            pct = (delta / abs(fa)) * 100.0
+    return {"events": events, "changes": changes, "delta": delta, "pct": pct,
+            "status": status}
+
+
+def _fmt_num(x):
+    if x is None:
+        return "-"
+    if abs(x) >= 1e6 or abs(x) < 1e-4:
+        return "{:.2e}".format(x)
+    return "{:.4g}".format(x)
+
+
+def print_cfu(run_a, run_b):
+    print("CFU of Culture #{} vs Culture #{}".format(run_a["number"], run_b["number"]))
+    print("(colony-forming units — a numeric measure of change)")
+    print()
+
+    ha = run_a.get("variables", {})
+    hb = run_b.get("variables", {})
+    names = sorted(set(list(ha.keys()) + list(hb.keys())))
+
+    if not names:
+        print("(no variables to compare)")
+        return
+
+    #                Variable        CFU   Δpos  Δval    Δ%
+    header = "{:<18} {:>6} {:>6} {:>12} {:>10}".format(
+        "Variable", "CFU", "Δpos", "Δ magnitude", "Δ %")
+    print(header)
+    print("-" * len(header))
+    for name in names:
+        m = cfu_metrics(ha.get(name), hb.get(name))
+        del_show = _fmt_num(m["delta"]) if m["delta"] is not None else "-"
+        pct_show = ("{:+.2f}%".format(m["pct"]) if m["pct"] is not None else "-")
+        print("{:<18} {:>6} {:>6} {:>12} {:>10}".format(
+            name, m["events"], m["changes"], del_show, pct_show))
+    print()
+    print("CFU = total value changes  ·  Δpos = differing positions  ·  "
+          "Δ magnitude/Δ% = final-value change")
+
+
+
+
+
 def deep_value_diff(a, b, path=""):
     """Return lines describing fine-grained differences inside list/dict values.
 
@@ -961,6 +1048,24 @@ def cmd_gram(args):
     print_compare(run_a, run_b)
 
 
+def cmd_cfu(args):
+    if len(args) < 2:
+        print("usage: petri cfu <run number A> <run number B>")
+        return 1
+    try:
+        a = int(args[0])
+        b = int(args[1])
+    except ValueError:
+        print("error: petri cfu: run numbers must be integers")
+        return 1
+    run_a = load_run(a)
+    run_b = load_run(b)
+    if not run_a or not run_b:
+        print("error: petri cfu: one or both runs not found ({} / {})".format(a, b))
+        return 1
+    print_cfu(run_a, run_b)
+
+
 def cmd_sterilize(args):
     if not os.path.isdir(RUNS_DIR):
         print("nothing to sterilize: no cultures exist")
@@ -1042,6 +1147,7 @@ usage:
   petri plate [--well NAME]                     list cultures (filter by well)
   petri scope <run>                             observe a culture's variable history
   petri gram <runA> <runB>                      differential test (diff) two cultures
+  petri cfu <runA> <runB>                       numeric change measure per variable
   petri incubate <program.py> <limit-ms>        time a run against a limit (ms)
   petri sterilize                               delete all cultures (confirm twice)
   petri --version                               print version
@@ -1071,6 +1177,8 @@ help:
         return cmd_scope(rest)
     if cmd == "gram":
         return cmd_gram(rest)
+    if cmd == "cfu":
+        return cmd_cfu(rest)
     if cmd == "sterilize":
         return cmd_sterilize(rest)
     if cmd == "incubate":

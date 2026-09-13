@@ -50,6 +50,7 @@ petri plate                              # list all cultures
 petri plate --well sweep                 # list cultures in one well
 petri scope 3                            # observe culture #3's variable history
 petri gram 2 3                           # differential test (diff) two cultures
+petri cfu 2 3                            # numeric change measure per variable
 petri incubate main.py 500               # time a run against a 500 ms limit
 petri sterilize                          # delete all cultures (confirm twice)
 ```
@@ -109,6 +110,17 @@ z
 For lists and dicts, `gram` drills into the structure and reports
 fine-grained changes, e.g. `config.lr: 0.1 → 0.01` or `items[1]: 2 → 9`, instead
 of a whole-value replacement.
+
+`petri cfu` (colony-forming units) is the numeric companion to `gram`: a table
+of per-variable change metrics — total value changes, differing positions, and
+the signed magnitude/% change of the final value — handy for spotting drift
+across a sweep:
+
+```
+Variable              CFU   Δpos  Δ magnitude        Δ %
+x                       6      1           10    +28.57%
+y                       2      1            4    +80.00%
+```
 
 ## What it records
 
