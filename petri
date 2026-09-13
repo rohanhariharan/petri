@@ -98,6 +98,28 @@ _PETRI_START = float(os.environ['PETRI_START'])
 # Behave like a real `python <program>` invocation:
 sys.argv = [os.environ['PETRI_PROGRAM']] + json.loads(os.environ.get('PETRI_ARGS', '[]'))
 
+# Optional variable filters (glob patterns), injected by the parent.
+#   _TRACK   -> if set, only record names matching one of these
+#   _IGNORE  -> if set, skip names matching any of these (empty => no filter)
+_TRACK = json.loads(os.environ.get('PETRI_TRACK', '[]'))
+_IGNORE = json.loads(os.environ.get('PETRI_IGNORE', '[]'))
+
+def _matches(patterns, name):
+    for p in patterns:
+        if p.endswith('*'):
+            if name.startswith(p[:-1]):
+                return True
+        elif p == name:
+            return True
+    return False
+
+def _allowed(name):
+    if _IGNORE and _matches(_IGNORE, name):
+        return False
+    if _TRACK and not _matches(_TRACK, name):
+        return False
+    return True
+
 def _snapshot(value, depth=0):
     _MAX = 20
     if isinstance(value, bool):
@@ -129,6 +151,8 @@ def _snapshot(value, depth=0):
     return None
 
 def __lab_record(name, value):
+    if not _allowed(name):
+        return
     snap = _snapshot(value)
     if snap is None:
         return
@@ -205,14 +229,15 @@ def instrument_source(source):
 # Running a program
 # ---------------------------------------------------------------------------
 
-def run_program(path, extra_args=None):
+def run_program(path, extra_args=None, track=None, ignore=None):
     """Run `path` in a real subprocess, return (history, duration_seconds, failed).
 
     The instrumented program runs as its own `python <path>` subprocess so
     os._exit, quit and sys.argv all behave exactly like a normal invocation.
     The subprocess records each change to a JSONL log (via PETRI_LOG); we read
     the log back and rebuild the per-variable history with millisecond
-    timestamps.
+    timestamps. `track`/`ignore` are lists of name patterns (supports `*`) that
+    filter which variables are recorded.
     """
     with open(path) as fh:
         source = fh.read()
@@ -227,6 +252,8 @@ def run_program(path, extra_args=None):
     env["PETRI_PROGRAM"] = os.path.abspath(path)
     env["PETRI_ARGS"] = json.dumps(extra_args)
     env["PETRI_START"] = str(time.monotonic())
+    env["PETRI_TRACK"] = json.dumps(track or [])
+    env["PETRI_IGNORE"] = json.dumps(ignore or [])
 
     start = time.monotonic()
     try:
@@ -430,10 +457,67 @@ def diff_histories(a, b):
         if av_val == bv_val:
             continue
         changed_any = True
-        left = fmt_value(av_val) if av_val is not None else "(none)"
-        right = fmt_value(bv_val) if bv_val is not None else "(none)"
-        changed.append("{} → {}".format(left, right))
+        if av_val is not None and bv_val is not None and _same_container_type(av_val, bv_val):
+            sub = deep_value_diff(av_val, bv_val)
+            if sub:
+                changed.append(", ".join(sub))
+            else:
+                changed.append("{} → {}".format(fmt_value(av_val), fmt_value(bv_val)))
+        else:
+            left = fmt_value(av_val) if av_val is not None else "(none)"
+            right = fmt_value(bv_val) if bv_val is not None else "(none)"
+            changed.append("{} → {}".format(left, right))
     return changed, ("changed" if changed_any else "unchanged")
+
+
+def _same_container_type(x, y):
+    return x.get("type") in ("list", "dict") and x.get("type") == y.get("type")
+
+
+def deep_value_diff(a, b, path=""):
+    """Return lines describing fine-grained differences inside list/dict values.
+
+    `a`, `b` are typed snapshots (dicts with "type"/"value"). Produces lines
+    like "config['lr']: 0.1 → 0.01" or "items[1]: 2 → 9".
+    """
+    if a["type"] == "list" and b["type"] == "list":
+        out = []
+        n = max(len(a["value"]), len(b["value"]))
+        for i in range(n):
+            av = a["value"][i] if i < len(a["value"]) else None
+            bv = b["value"][i] if i < len(b["value"]) else None
+            if av == bv:
+                continue
+            at = av or {"type": "repr", "value": "(none)"}
+            bt = bv or {"type": "repr", "value": "(none)"}
+            if av is not None and bv is not None and _same_container_type(av, bv):
+                inner = deep_value_diff(av, bv, path="")
+                if inner:
+                    out.append("{}[{}] {{{}}}".format(path, i, ", ".join(inner)))
+                    continue
+            out.append("{}[{}]: {} → {}".format(path, i, fmt_value(at), fmt_value(bt)))
+        return out
+    if a["type"] == "dict" and b["type"] == "dict":
+        out = []
+        keys = list(a["value"].keys())
+        for k in b["value"].keys():
+            if k not in keys:
+                keys.append(k)
+        for k in keys:
+            av = a["value"].get(k)
+            bv = b["value"].get(k)
+            if av == bv:
+                continue
+            at = av or {"type": "repr", "value": "(none)"}
+            bt = bv or {"type": "repr", "value": "(none)"}
+            if _same_container_type(at, bt):
+                inner = deep_value_diff(at, bt)
+                if inner:
+                    out.append("{}{} {{{}}}".format(path, k, ", ".join(inner)))
+                    continue
+            out.append("{}{}: {} → {}".format(path, k, fmt_value(at), fmt_value(bt)))
+        return out
+    return []
 
 
 def print_compare(run_a, run_b):
@@ -506,14 +590,14 @@ def print_compare(run_a, run_b):
 
 def cmd_culture(args):
     if len(args) < 1:
-        print("usage: petri culture <program.py> [--well NAME]")
+        print("usage: petri culture <program.py> [--well NAME] [--track N] [--ignore N]")
         return 1
     program = args[0]
     if not os.path.isfile(program):
         print("error: petri culture: no such file: {}".format(program))
         return 1
 
-    well = None
+    well, track, ignore = None, [], []
     i = 1
     while i < len(args):
         a = args[i]
@@ -523,11 +607,23 @@ def cmd_culture(args):
         elif a.startswith("--well="):
             well = a.split("=", 1)[1]
             i += 1
+        elif a == "--track" and i + 1 < len(args):
+            track.extend(args[i + 1].split(","))
+            i += 2
+        elif a.startswith("--track="):
+            track.extend(a.split("=", 1)[1].split(","))
+            i += 1
+        elif a == "--ignore" and i + 1 < len(args):
+            ignore.extend(args[i + 1].split(","))
+            i += 2
+        elif a.startswith("--ignore="):
+            ignore.extend(a.split("=", 1)[1].split(","))
+            i += 1
         else:
             i += 1
 
     print("Growing {}...".format(program))
-    history, duration, failed = run_program(program)
+    history, duration, failed = run_program(program, track=track, ignore=ignore)
     number, path = save_run(os.path.basename(program), duration, history,
                             failed, well=well)
 
@@ -546,6 +642,7 @@ def cmd_batch(args):
     program = None
     times = 10
     well = None
+    track, ignore = [], []
     i = 0
     while i < len(args):
         a = args[i]
@@ -570,12 +667,24 @@ def cmd_batch(args):
         elif a.startswith("--well="):
             well = a.split("=", 1)[1]
             i += 1
+        elif a == "--track" and i + 1 < len(args):
+            track.extend(args[i + 1].split(","))
+            i += 2
+        elif a.startswith("--track="):
+            track.extend(a.split("=", 1)[1].split(","))
+            i += 1
+        elif a == "--ignore" and i + 1 < len(args):
+            ignore.extend(args[i + 1].split(","))
+            i += 2
+        elif a.startswith("--ignore="):
+            ignore.extend(a.split("=", 1)[1].split(","))
+            i += 1
         else:
             program = a
             i += 1
 
     if not program:
-        print("usage: petri batch <program.py> [--times N] [--well NAME]")
+        print("usage: petri batch <program.py> [--times N] [--well NAME] [--track N] [--ignore N]")
         return 1
     if not os.path.isfile(program):
         print("error: petri batch: no such file: {}".format(program))
@@ -586,7 +695,7 @@ def cmd_batch(args):
     exit_code = 0
     for n in range(1, times + 1):
         print("\rpetri is culturing... [culture {}/{}]".format(n, times), end="", flush=True)
-        history, duration, failed = run_program(program)
+        history, duration, failed = run_program(program, track=track, ignore=ignore)
         run_well = well if well else None
         num, path = save_run(os.path.basename(program), duration, history,
                              failed, well=run_well)
@@ -723,8 +832,8 @@ def main(argv):
         print("""petri - grow, observe, compare
 
 usage:
-  petri culture <program.py> [--well NAME]     grow a run (optionally into a well)
-  petri batch <program.py> [--times N] [--well NAME]
+  petri culture <program.py> [--well NAME] [--track N] [--ignore N]  grow a run (optionally into a well, filter vars)
+  petri batch <program.py> [--times N] [--well NAME] [--track N] [--ignore N]
                                                 grow N runs (default 10)
   petri plate [--well NAME]                     list cultures (filter by well)
   petri scope <run>                             observe a culture's variable history

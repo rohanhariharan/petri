@@ -37,21 +37,26 @@ The language is the lab: you *grow* a culture, *plate* your dishes, *scope* a
 sample, and run a differential *Gram test* to compare.
 
 ```sh
-petri culture main.py          # grow a run, record variables
-petri culture main.py --well baseline # grow a run into a named well
-petri batch main.py --times 10 # grow N cultures (default 10)
-petri plate                    # list all cultures
-petri plate --well sweep       # list cultures in one well
-petri scope 3                  # observe culture #3's variable history
-petri gram 2 3                 # differential test (diff) two cultures
-petri incubate main.py 500     # time a run against a 500 ms limit
-petri sterilize                # delete all cultures (confirm twice)
+petri culture main.py                    # grow a run, record variables
+petri culture main.py --well baseline     # grow a run into a named well
+petri culture main.py --track config     # record only matching variables
+petri culture main.py --ignore *_iter    # skip matching variables
+petri batch main.py --times 10           # grow N cultures (default 10)
+petri plate                              # list all cultures
+petri plate --well sweep                 # list cultures in one well
+petri scope 3                            # observe culture #3's variable history
+petri gram 2 3                           # differential test (diff) two cultures
+petri incubate main.py 500               # time a run against a 500 ms limit
+petri sterilize                          # delete all cultures (confirm twice)
 ```
 
 Cultures can be grouped into named **wells** (a multiwell plate). Tag a single
 run with `--well baseline`, or sweep a batch `petri batch sim.py --times 20
 --well sweep`, then filter with `petri plate --well sweep` and diff any two of
 them.
+
+`--track` / `--ignore` filter which variables get recorded; both accept
+comma-separated exact names or `*` wildcards (e.g. `--ignore foo_*`).
 
 `petri incubate` runs the file as a real subprocess (no instrumentation) and
 exits `0` if it finished within the limit (green), or `1` if it exceeded it
@@ -91,6 +96,10 @@ x
 z
   15 → 25
 ```
+
+For lists and dicts, `gram` drills into the structure and reports
+fine-grained changes, e.g. `config.lr: 0.1 → 0.01` or `items[1]: 2 → 9`, instead
+of a whole-value replacement.
 
 ## What it records
 
