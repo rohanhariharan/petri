@@ -299,7 +299,7 @@ def current_run_number():
     return (max(numbers) + 1) if numbers else 1
 
 
-def save_run(program, duration, history, failed=False):
+def save_run(program, duration, history, failed=False, well=None):
     os.makedirs(RUNS_DIR, exist_ok=True)
     number = current_run_number()
     run_id = uuidmod.uuid4().hex
@@ -308,6 +308,7 @@ def save_run(program, duration, history, failed=False):
         "number": number,
         "uuid": run_id,
         "program": program,
+        "well": well,
         "start": datetime.datetime.now().isoformat(timespec="seconds"),
         "duration": duration,
         "failed": failed,
@@ -369,9 +370,11 @@ def fmt_value(snap, max_len=60):
     return text
 
 
-def print_run_summary(run):
+def print_run_summary(run, well=None):
     tag = " [FAILED]" if run.get("failed") else ""
     print("Culture #{}{}".format(run["number"], tag))
+    if well:
+        print("Well: {}".format(well))
     print("Program: {}".format(run["program"]))
     print("Duration: {}".format(fmt_seconds(run["duration"])))
     print("Variables recorded: {}".format(run["variable_count"]))
@@ -382,14 +385,15 @@ def print_runs(runs):
     if not runs:
         print("No cultures yet. Run 'petri culture <program.py>' to grow one.")
         return
-    header = "{:<4} {:<12} {:<10} {:<10}".format("ID", "Program", "Date", "Duration")
+    header = "{:<4} {:<14} {:<12} {:<10} {:<10}".format("ID", "Well", "Program", "Date", "Duration")
     print(header)
     print("-" * len(header))
     for r in runs:
         date = r["start"][:10]
         failmark = "  (failed)" if r.get("failed") else ""
-        print("{:<4} {:<12} {:<10} {:<10}{}".format(
-            r["number"], r["program"], date, fmt_seconds(r["duration"]), failmark))
+        well = r.get("well") or "-"
+        print("{:<4} {:<14} {:<12} {:<10} {:<10}{}".format(
+            r["number"], well, r["program"], date, fmt_seconds(r["duration"]), failmark))
 
 
 def print_inspect(run):
@@ -502,16 +506,30 @@ def print_compare(run_a, run_b):
 
 def cmd_culture(args):
     if len(args) < 1:
-        print("usage: petri culture <program.py>")
+        print("usage: petri culture <program.py> [--well NAME]")
         return 1
     program = args[0]
     if not os.path.isfile(program):
         print("error: petri culture: no such file: {}".format(program))
         return 1
 
+    well = None
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--well" and i + 1 < len(args):
+            well = args[i + 1]
+            i += 2
+        elif a.startswith("--well="):
+            well = a.split("=", 1)[1]
+            i += 1
+        else:
+            i += 1
+
     print("Growing {}...".format(program))
     history, duration, failed = run_program(program)
-    number, path = save_run(os.path.basename(program), duration, history, failed)
+    number, path = save_run(os.path.basename(program), duration, history,
+                            failed, well=well)
 
     print()
     print_run_summary({
@@ -519,7 +537,7 @@ def cmd_culture(args):
         "program": os.path.basename(program),
         "duration": duration,
         "variable_count": sum(len(v) for v in history.values()),
-    })
+    }, well)
     print("Culture saved.")
     return 1 if failed else 0
 
@@ -527,6 +545,7 @@ def cmd_culture(args):
 def cmd_batch(args):
     program = None
     times = 10
+    well = None
     i = 0
     while i < len(args):
         a = args[i]
@@ -544,12 +563,19 @@ def cmd_batch(args):
             except ValueError:
                 print("error: --times needs an integer")
                 return 1
+            i += 1
+        elif a == "--well" and i + 1 < len(args):
+            well = args[i + 1]
+            i += 2
+        elif a.startswith("--well="):
+            well = a.split("=", 1)[1]
+            i += 1
         else:
             program = a
-        i += 1
+            i += 1
 
     if not program:
-        print("usage: petri batch <program.py> [--times N]")
+        print("usage: petri batch <program.py> [--times N] [--well NAME]")
         return 1
     if not os.path.isfile(program):
         print("error: petri batch: no such file: {}".format(program))
@@ -561,7 +587,9 @@ def cmd_batch(args):
     for n in range(1, times + 1):
         print("\rpetri is culturing... [culture {}/{}]".format(n, times), end="", flush=True)
         history, duration, failed = run_program(program)
-        num, path = save_run(os.path.basename(program), duration, history, failed)
+        run_well = well if well else None
+        num, path = save_run(os.path.basename(program), duration, history,
+                             failed, well=run_well)
         if failed:
             exit_code = 1
         results.append((num, duration, sum(len(v) for v in history.values())))
@@ -575,7 +603,15 @@ def cmd_batch(args):
 
 
 def cmd_plate(args):
-    print_runs(all_runs())
+    runs = all_runs()
+    if args and (args[0] == "--well" or args[0].startswith("--well=")):
+        if args[0].startswith("--well="):
+            well = args[0].split("=", 1)[1]
+        else:
+            well = args[1] if len(args) > 1 else None
+        if well is not None:
+            runs = [r for r in runs if r.get("well") == well]
+    print_runs(runs)
 
 
 def cmd_scope(args):
@@ -687,13 +723,14 @@ def main(argv):
         print("""petri - grow, observe, compare
 
 usage:
-  petri culture <program.py>              grow a run and record variables
-  petri batch <program.py> [--times N]    grow N runs (default 10)
-  petri plate                             list all cultures (runs)
-  petri scope <run>                       observe a culture's variable history
-  petri gram <runA> <runB>                differential test (diff) two cultures
-  petri incubate <program.py> <limit-ms>  time a run against a limit (ms)
-  petri sterilize                         delete all cultures (confirm twice)
+  petri culture <program.py> [--well NAME]     grow a run (optionally into a well)
+  petri batch <program.py> [--times N] [--well NAME]
+                                                grow N runs (default 10)
+  petri plate [--well NAME]                     list cultures (filter by well)
+  petri scope <run>                             observe a culture's variable history
+  petri gram <runA> <runB>                      differential test (diff) two cultures
+  petri incubate <program.py> <limit-ms>        time a run against a limit (ms)
+  petri sterilize                               delete all cultures (confirm twice)
 
 help:
   petri help""")
