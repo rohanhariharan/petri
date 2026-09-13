@@ -591,6 +591,122 @@ def print_compare(run_a, run_b):
 # CLI
 # ---------------------------------------------------------------------------
 
+# A small palette so each plate gets its own accent color.
+_PLATE_COLORS = [
+    (231, 130, 255),   # violet
+    (255, 130, 205),   # pink
+    (140, 255, 130),   # mint
+    (255, 210, 130),   # amber
+    (255, 140, 140),   # coral
+    (130, 205, 255),   # sky
+]
+
+
+def _ansi256(rgb, bg=False):
+    """Map an (r,g,b) triplet to the closest xterm 256-color code."""
+    best = None
+    best_d = 1e9
+    for code in range(16, 256):
+        if 232 <= code <= 255:
+            t = (code - 232) * 10 + 8
+            r = g = b = t
+        else:
+            v = code - 16
+            r = ((v // 36) % 6) * 51
+            g = ((v // 6) % 6) * 51
+            b = (v % 6) * 51
+        d = (rgb[0] - r) ** 2 + (rgb[1] - g) ** 2 + (rgb[2] - b) ** 2
+        if d < best_d:
+            best_d = d
+            best = code
+    return "\033[{};5;{}m".format(48 if bg else 38, best)
+
+
+def _well_color(idx):
+    return _ansi256(_PLATE_COLORS[idx % len(_PLATE_COLORS)])
+
+
+def _colony_color(run_idx):
+    return _ansi256(_PLATE_COLORS[(run_idx + 1) % len(_PLATE_COLORS)])
+
+
+def _colony_bg(run_idx):
+    return _ansi256(_PLATE_COLORS[(run_idx + 1) % len(_PLATE_COLORS)], bg=True)
+
+
+def _draw_dish(title, cultures, well_color=""):
+    """Draw one well as an ASCII petri dish ring, one colored colony per culture."""
+    R = 4
+    RESET = "\033[0m"
+    w = 2 * R + 1
+    rim = "    " + ("o" + " " * w + "o")
+    inner = "    " + " " + ("o" + " " * (w - 2) + "o")
+
+    n = len(cultures)
+    positions = []
+    span = w - 2  # usable inner width (between the two 'o' rims)
+    if n > 0 and span > 0:
+        # spread colonies across the ring's inner width
+        for i in range(n):
+            positions.append(1 + int(span * i / max(1, n - 1)))
+
+    mid_cells = [" "] * (w + 2)
+    for i, c in enumerate(cultures):
+        p = positions[i] + 1
+        if p < len(mid_cells):
+            mid_cells[p] = _colony_color(c.get("_idx", 0)) + "o" + RESET
+    mid_line = "    " + "o" + "".join(mid_cells) + "o"
+
+    lines = [rim, inner, mid_line, inner, rim, "", "  "]
+    # caption + culture list
+    cap = (well_color + title + RESET) if well_color else title
+    if cultures:
+        cap += "  ({})".format(len(cultures))
+    else:
+        cap += "  (empty)"
+    lines.append("  " + cap)
+    for c in cultures:
+        lines.append("     {}#{}  {}  {}".format(
+            _colony_color(c.get("_idx", 0)) + "o" + RESET,
+            c["number"], c["program"],
+            "[failed]" if c.get("failed") else ""))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_agar(runs):
+    RESET = "\033[0m"
+    total_bytes = 0
+    for fn in os.listdir(RUNS_DIR):
+        p = os.path.join(RUNS_DIR, fn)
+        if os.path.exists(p):
+            total_bytes += os.path.getsize(p)
+
+    wells = sorted({r.get("well") for r in runs if r.get("well")})
+    # group cultures by well (None -> '(no well)')
+    groups = {}
+    for i, r in enumerate(runs):
+        r["_idx"] = i
+        key = r.get("well") or "(no well)"
+        groups.setdefault(key, []).append(r)
+    ordered = []
+    for w in wells:
+        ordered.append(w)
+    if "(no well)" in groups:
+        ordered.append("(no well)")
+
+    print("Agar (workspace): {}".format(DATA_DIR))
+    print("{} cultures · {} wells · {:.1f} kB".format(
+        len(runs), len(wells), total_bytes / 1024.0))
+    print()
+    for k, wi in enumerate(ordered):
+        color = _well_color(k)
+        print("{}▲ well: {}{}".format(color, (wi if wi != "(no well)" else "unanchored"),
+                                      RESET))
+        print(_draw_dish(wi, groups[wi], well_color=_well_color(k)))
+    return 0
+
+
 def cmd_agar(args):
     """Manage the lab's substrate — the workspace every culture grows on."""
     subcmd = args[0] if args else "status"
@@ -598,20 +714,10 @@ def cmd_agar(args):
     if subcmd == "status":
         if not os.path.isdir(RUNS_DIR):
             print("Agar (workspace): {}".format(DATA_DIR))
-            print("  no cultures yet")
+            print("  the dish is empty — no cultures yet")
             return 0
         runs = all_runs()
-        total_bytes = 0
-        for fn in os.listdir(RUNS_DIR):
-            p = os.path.join(RUNS_DIR, fn)
-            if os.path.exists(p):
-                total_bytes += os.path.getsize(p)
-        wells = sorted({r.get("well") for r in runs if r.get("well")})
-        print("Agar (workspace): {}".format(DATA_DIR))
-        print("  cultures: {}".format(len(runs)))
-        print("  wells:    {}".format(", ".join(wells) if wells else "(none)"))
-        print("  size:     {:.1f} kB".format(total_bytes / 1024.0))
-        return 0
+        return render_agar(runs)
 
     if subcmd == "path":
         print(RUNS_DIR if os.path.isdir(RUNS_DIR) else DATA_DIR)
