@@ -37,6 +37,10 @@ The language is the lab: you *grow* a culture, *plate* your dishes, *scope* a
 sample, and run a differential *Gram test* to compare.
 
 ```sh
+petri agar                           # lab status: cultures, wells, size
+petri agar path                      # where cultures are stored
+petri agar export plate.tar          # back up / share all cultures
+petri agar import plate.tar          # restore cultures (auto-renumber on conflicts)
 petri culture main.py                    # grow a run, record variables
 petri culture main.py --well baseline     # grow a run into a named well
 petri culture main.py --track config     # record only matching variables
@@ -49,6 +53,11 @@ petri gram 2 3                           # differential test (diff) two cultures
 petri incubate main.py 500               # time a run against a 500 ms limit
 petri sterilize                          # delete all cultures (confirm twice)
 ```
+
+`petri agar` is the lab's substrate — the workspace every culture grows on. Use
+it to check lab status, find the storage path, and bundle or restore your
+cultures with `export`/`import` (import renumbers automatically if ids collide,
+so numbers always stay unique).
 
 Cultures can be grouped into named **wells** (a multiwell plate). Tag a single
 run with `--well baseline`, or sweep a batch `petri batch sim.py --times 20

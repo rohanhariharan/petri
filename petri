@@ -12,8 +12,11 @@ import ast
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import uuid as uuidmod
 
@@ -588,6 +591,99 @@ def print_compare(run_a, run_b):
 # CLI
 # ---------------------------------------------------------------------------
 
+def cmd_agar(args):
+    """Manage the lab's substrate — the workspace every culture grows on."""
+    subcmd = args[0] if args else "status"
+
+    if subcmd == "status":
+        if not os.path.isdir(RUNS_DIR):
+            print("Agar (workspace): {}".format(DATA_DIR))
+            print("  no cultures yet")
+            return 0
+        runs = all_runs()
+        total_bytes = 0
+        for fn in os.listdir(RUNS_DIR):
+            p = os.path.join(RUNS_DIR, fn)
+            if os.path.exists(p):
+                total_bytes += os.path.getsize(p)
+        wells = sorted({r.get("well") for r in runs if r.get("well")})
+        print("Agar (workspace): {}".format(DATA_DIR))
+        print("  cultures: {}".format(len(runs)))
+        print("  wells:    {}".format(", ".join(wells) if wells else "(none)"))
+        print("  size:     {:.1f} kB".format(total_bytes / 1024.0))
+        return 0
+
+    if subcmd == "path":
+        print(RUNS_DIR if os.path.isdir(RUNS_DIR) else DATA_DIR)
+        return 0
+
+    if subcmd == "export":
+        out = args[1] if len(args) > 1 else None
+        runs = all_runs()
+        if not runs:
+            print("agar: nothing to export (no cultures)")
+            return 1
+        if not out:
+            out = os.path.join(os.getcwd(), "petri-export-{}.tar".format(
+                datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
+        if not (out.endswith(".tar") or out.endswith(".tgz") or out.endswith(".tar.gz")):
+            print("agar: export path must end in .tar, .tgz, or .tar.gz")
+            return 1
+        with tarfile.open(out, "w:gz" if out.endswith((".tgz", ".tar.gz")) else "w") as tar:
+            for fn in os.listdir(RUNS_DIR):
+                p = os.path.join(RUNS_DIR, fn)
+                if os.path.isfile(p):
+                    tar.add(p, arcname="runs/" + fn)
+        print("Exported {} culture(s) to {}".format(len(runs), out))
+        return 0
+
+    if subcmd == "import":
+        if len(args) < 2:
+            print("usage: petri agar import <archive.tar[.gz]>")
+            return 1
+        src = args[1]
+        if not os.path.isfile(src):
+            print("agar: no such file: {}".format(src))
+            return 1
+        if not tarfile.is_tarfile(src):
+            print("agar: not a tar archive: {}".format(src))
+            return 1
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="petri-agar-")
+        try:
+            with tarfile.open(src) as tar:
+                tar.extractall(tmp, filter="data")
+            imported = 0
+            src_runs = os.path.join(tmp, "runs")
+            if os.path.isdir(src_runs):
+                for fn in sorted(os.listdir(src_runs)):
+                    if not fn.endswith(".json"):
+                        continue
+                    # load the run content so we can renumber on collision
+                    try:
+                        with open(os.path.join(src_runs, fn)) as _f:
+                            run = json.load(_f)
+                    except (OSError, ValueError):
+                        continue
+                    number = run.get("number", 1)
+                    dst = os.path.join(RUNS_DIR, fn)
+                    # renumber if that id already exists, to keep numbers unique
+                    if any(r.get("number") == number for r in all_runs()):
+                        run["number"] = current_run_number()
+                        run["uuid"] = uuidmod.uuid4().hex
+                        dst = os.path.join(RUNS_DIR, "{}-{}.json".format(run["number"], run["uuid"]))
+                    with open(dst, "w") as _f:
+                        json.dump(run, _f, indent=2)
+                    imported += 1
+            print("Imported {} culture(s) from {}".format(imported, src))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return 0
+
+    print("usage: petri agar [status] [path] [export <dest.tar>] [import <archive.tar>]")
+    return 1
+
+
 def cmd_culture(args):
     if len(args) < 1:
         print("usage: petri culture <program.py> [--well NAME] [--track N] [--ignore N]")
@@ -832,9 +928,9 @@ def main(argv):
         print("""petri - grow, observe, compare
 
 usage:
-  petri culture <program.py> [--well NAME] [--track N] [--ignore N]  grow a run (optionally into a well, filter vars)
-  petri batch <program.py> [--times N] [--well NAME] [--track N] [--ignore N]
-                                                grow N runs (default 10)
+  petri agar [status] [path] [export <dest.tar>] [import <arch.tar>]  manage the workspace
+  petri culture <program.py> [--well NAME] [--track N] [--ignore N]  grow a run
+  petri batch <program.py> [--times N] [--well NAME] [--track N] [--ignore N]  grow N runs (default 10)
   petri plate [--well NAME]                     list cultures (filter by well)
   petri scope <run>                             observe a culture's variable history
   petri gram <runA> <runB>                      differential test (diff) two cultures
@@ -850,6 +946,8 @@ help:
 
     if cmd == "help":
         return main([])
+    if cmd == "agar":
+        return cmd_agar(rest)
     if cmd == "culture":
         return cmd_culture(rest)
     if cmd == "batch":
