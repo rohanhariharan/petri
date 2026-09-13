@@ -12,11 +12,9 @@ import ast
 import datetime
 import json
 import os
-import random
 import subprocess
 import sys
 import time
-import traceback
 import uuid as uuidmod
 
 DATA_DIR = os.path.expanduser("~/.petri")
@@ -84,28 +82,60 @@ def snapshot_value(value, depth=0):
 
 
 # ---------------------------------------------------------------------------
-# Recording target (runs inside the instrumented program)
+# Recording target (injected into the instrumented program, runs in a subprocess)
 # ---------------------------------------------------------------------------
 
-class Recorder:
-    def __init__(self):
-        self.history = {}  # name -> list of {value, tick}
+# The instrumented program runs in its own subprocess (so os._exit / quit /
+# sys.argv all behave exactly like `python main.py`). To survive even a hard
+# os._exit() — which bypasses every Python cleanup hook — the recorder appends
+# each change to a JSONL log file the moment it happens. The parent process
+# reads that log back after the child exits.
+PRELUDE = """
+import json, os, sys, time as _t
 
-    def record(self, name, value):
-        snap, ok = snapshot_value(value)
-        if not ok:
-            return
-        self.history.setdefault(name, []).append(
-            {"value": snap, "tick": len(self.history.get(name, []))}
-        )
+_PETRI_LOG = os.environ['PETRI_LOG']
+_PETRI_START = float(os.environ['PETRI_START'])
+# Behave like a real `python <program>` invocation:
+sys.argv = [os.environ['PETRI_PROGRAM']] + json.loads(os.environ.get('PETRI_ARGS', '[]'))
 
+def _snapshot(value, depth=0):
+    _MAX = 20
+    if isinstance(value, bool):
+        return {"type": "bool", "value": bool(value)}
+    if isinstance(value, int):
+        return {"type": "int", "value": int(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": float(value)}
+    if isinstance(value, str):
+        return {"type": "str", "value": str(value)}
+    if value is None:
+        return {"type": "None", "value": None}
+    if isinstance(value, (list, tuple)):
+        if depth >= _MAX:
+            return {"type": "list", "value": [repr(value)]}
+        return {"type": "list", "value": [_snapshot(it, depth + 1) for it in value]}
+    if isinstance(value, dict):
+        if depth >= _MAX:
+            return {"type": "dict", "value": {"<repr>": repr(value)}}
+        out = {}
+        try:
+            iterable = value.items()
+        except AttributeError:
+            return {"type": "dict", "value": {"<repr>": repr(value)}}
+        for k, v in iterable:
+            kk = k if isinstance(k, str) else repr(k)
+            out[kk] = _snapshot(v, depth + 1)
+        return {"type": "dict", "value": out}
+    return None
 
-def _make_recorder_globals():
-    """Build a module globals dict injected into the instrumented program."""
-    g = dict(globals())
-    g["__lab_recorder"] = Recorder()
-    g["__lab_record"] = g["__lab_recorder"].record
-    return g
+def __lab_record(name, value):
+    snap = _snapshot(value)
+    if snap is None:
+        return
+    rec = {"n": name, "v": snap, "t": (_t.monotonic() - _PETRI_START) * 1000.0}
+    with open(_PETRI_LOG, "a") as _f:
+        _f.write(json.dumps(rec, default=repr) + "\\n")
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -175,47 +205,82 @@ def instrument_source(source):
 # Running a program
 # ---------------------------------------------------------------------------
 
-def run_program(path):
-    """Run `path`, return (recorder, duration_seconds).
+def run_program(path, extra_args=None):
+    """Run `path` in a real subprocess, return (history, duration_seconds, failed).
 
-    Instrumentation and execution happen in this same process so that the
-    in-memory Recorder object is directly accessible afterwards — no IPC, no
-    temp files, no subprocess needed. The program's own imports/side effects
-    run as normal.
+    The instrumented program runs as its own `python <path>` subprocess so
+    os._exit, quit and sys.argv all behave exactly like a normal invocation.
+    The subprocess records each change to a JSONL log (via PETRI_LOG); we read
+    the log back and rebuild the per-variable history with millisecond
+    timestamps.
     """
     with open(path) as fh:
         source = fh.read()
-    instrumented = instrument_source(source)
+    instrumented = PRELUDE + "\n" + instrument_source(source)
 
-    g = _make_recorder_globals()
-    g.setdefault("__name__", "__lab_main__")
+    temp_runner = _write_runner(instrumented, path)
+    log_path = _temp_log_path()
+    extra_args = extra_args or []
+
+    env = dict(os.environ)
+    env["PETRI_LOG"] = log_path
+    env["PETRI_PROGRAM"] = os.path.abspath(path)
+    env["PETRI_ARGS"] = json.dumps(extra_args)
+    env["PETRI_START"] = str(time.monotonic())
 
     start = time.monotonic()
-    failed = False
     try:
-        exec(compile(instrumented, path, "exec"), g)
-    except SystemExit:
-        pass
-    except BaseException:
-        # Don't mask the program's failure; the run is still recorded.
-        failed = True
-        traceback.print_exc()
+        proc = subprocess.run(
+            [sys.executable, temp_runner],
+            env=env,
+            cwd=os.path.dirname(os.path.abspath(path)) or None,
+        )
     finally:
         duration = time.monotonic() - start
+        if os.path.exists(temp_runner):
+            os.remove(temp_runner)
 
-    return g["__lab_recorder"], duration, failed
+    failed = proc.returncode != 0
+    history = _read_history(log_path)
+    if os.path.exists(log_path):
+        os.remove(log_path)
+    return history, duration, failed
 
 
-# ---------------------------------------------------------------------------
-# History -> plain dict (for storage / display)
-# ---------------------------------------------------------------------------
+def _write_runner(instrumented, path):
+    """Write the instrumented source to a temp .py the subprocess will exec."""
+    import tempfile
+    fd, temp_runner = tempfile.mkstemp(prefix="petri-", suffix=".py",
+                                        dir=os.path.dirname(os.path.abspath(path)),
+                                        text=True)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(instrumented)
+    return temp_runner
 
-def recorder_history_to_dict(recorder):
-    """Return {name: [typed-snap, ...]} preserving insertion order."""
-    out = {}
-    for name, entries in recorder.history.items():
-        out[name] = [e["value"] for e in entries]
-    return out
+
+def _temp_log_path():
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="petri-log-", suffix=".jsonl", text=True)
+    os.close(fd)
+    os.remove(path)
+    return path
+
+
+def _read_history(log_path):
+    """Rebuild {name: [ {value, t_ms}, ... ]} from the JSONL log lines."""
+    history = {}
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                rec.setdefault("t", 0.0)
+                history.setdefault(rec["n"], []).append(rec)
+    except (OSError, ValueError):
+        return {}
+    return history
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +405,12 @@ def print_inspect(run):
     for name, snaps in history.items():
         print(name)
         for snap in snaps:
-            print("  {}".format(fmt_value(snap)))
+            t = snap.get("t", 0.0)
+            print("  [{:>7.1f}ms] {}".format(t, fmt_value(snap.get("v", snap))))
 
 
 def diff_histories(a, b):
-    """Compare two value histories (list of snaps). Returns (changed_lines, status).
+    """Compare two value histories (list of record dicts). Returns (changed_lines, status).
 
     status: "changed" if any position differs, else "unchanged" (including
     when histories are empty/equal in length and equal in value).
@@ -355,11 +421,13 @@ def diff_histories(a, b):
     for i in range(n):
         av = a[i] if i < len(a) else None
         bv = b[i] if i < len(b) else None
-        if av == bv:
+        av_val = av.get("v") if isinstance(av, dict) else av
+        bv_val = bv.get("v") if isinstance(bv, dict) else bv
+        if av_val == bv_val:
             continue
         changed_any = True
-        left = fmt_value(av) if av is not None else "(none)"
-        right = fmt_value(bv) if bv is not None else "(none)"
+        left = fmt_value(av_val) if av_val is not None else "(none)"
+        right = fmt_value(bv_val) if bv_val is not None else "(none)"
         changed.append("{} → {}".format(left, right))
     return changed, ("changed" if changed_any else "unchanged")
 
@@ -382,13 +450,13 @@ def print_compare(run_a, run_b):
             if status == "changed":
                 changed_vars[name] = lines
             else:
-                unchanged_vars[name] = ha[name][-1]
+                unchanged_vars[name] = ha[name][-1]["v"]
         else:
-            removed[name] = ha[name][-1]
+            removed[name] = ha[name][-1]["v"]
 
     for name in hb:
         if name not in ha:
-            added[name] = hb[name][-1]
+            added[name] = hb[name][-1]["v"]
 
     print("Gram-positive (changed)")
     print("-" * 30)
@@ -442,8 +510,7 @@ def cmd_culture(args):
         return 1
 
     print("Growing {}...".format(program))
-    recorder, duration, failed = run_program(program)
-    history = recorder_history_to_dict(recorder)
+    history, duration, failed = run_program(program)
     number, path = save_run(os.path.basename(program), duration, history, failed)
 
     print()
@@ -493,8 +560,7 @@ def cmd_batch(args):
     exit_code = 0
     for n in range(1, times + 1):
         print("\rpetri is culturing... [culture {}/{}]".format(n, times), end="", flush=True)
-        recorder, duration, failed = run_program(program)
-        history = recorder_history_to_dict(recorder)
+        history, duration, failed = run_program(program)
         num, path = save_run(os.path.basename(program), duration, history, failed)
         if failed:
             exit_code = 1

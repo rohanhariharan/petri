@@ -86,21 +86,25 @@ Top-level variables (assignments) with basic Python values:
 
 integers · floats · strings · booleans · lists · dictionaries · tuples · `None`
 
-Function locals, imports, and class bodies are left untracked for now. Arbitrary
-objects are skipped rather than crash the run.
+Each recorded change also carries a **millisecond timestamp** (elapsed since the
+run started), shown by `petri scope`. Function locals, imports, and class bodies
+are left untracked for now. Arbitrary objects are skipped rather than crash the
+run.
 
 ## How it works
 
 `petri` rewrites top-level assignments using Python's standard `ast` module,
-wrapping each with a recorder call, then executes the instrumented program
-in-process. Runs are saved under `~/.petri/runs/` as JSON.
+wrapping each with a recorder call. The instrumented program runs as a real
+**subprocess** (`python <program>`), so `os._exit()`, `quit()`, `if __name__ ==
+"__main__"`, and `sys.argv` all behave exactly like a normal invocation. The
+recorder appends each change to a JSONL log the instant it happens — so even a
+hard `os._exit()` leaves the captured state on disk. Runs are saved under
+`~/.petri/runs/` as JSON.
 
 ## Known limitations
 
-- The program executes inside petri's own interpreter, so `if __name__ ==
-  "__main__"` guards and calls like `quit()`/`os._exit()` behave slightly
-  differently than running `python main.py` directly.
 - Top-level only — functions aren't instrumented yet.
+- `petri incubate` times a run as a subprocess but doesn't instrument it.
 
 ## License
 
