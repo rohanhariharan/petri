@@ -545,6 +545,29 @@ def cmd_compare(args):
     print_compare(run_a, run_b)
 
 
+def cmd_wipe(args):
+    if not os.path.isdir(RUNS_DIR):
+        print("nothing to wipe: no runs exist")
+        return 0
+
+    n = len(all_runs())
+    print("This will permanently delete all {} saved run(s).".format(n))
+
+    for _ in range(2):
+        answer = input('Type "yes" to confirm: ').strip().lower()
+        if answer != "yes":
+            print("aborted.")
+            return 1
+
+    for fn in os.listdir(RUNS_DIR):
+        p = os.path.join(RUNS_DIR, fn)
+        if os.path.isfile(p):
+            os.remove(p)
+    os.rmdir(RUNS_DIR)
+    print("All {} run(s) wiped.".format(n))
+    return 0
+
+
 def main(argv):
     if not argv:
         print("""petri - grow, observe, compare
@@ -555,6 +578,7 @@ usage:
   petri runs                            list saved runs
   petri inspect <run>                   show a run's variable history
   petri compare <runA> <runB>           diff two runs
+  petri wipe                            delete all runs (confirm twice)
 
 help:
   petri help""")
@@ -575,6 +599,8 @@ help:
         return cmd_inspect(rest)
     if cmd == "compare":
         return cmd_compare(rest)
+    if cmd == "wipe":
+        return cmd_wipe(rest)
 
     print("unknown command: {}".format(cmd))
     return main([])

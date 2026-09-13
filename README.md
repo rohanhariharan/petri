@@ -34,6 +34,7 @@ petri batch main.py --times 10   # run N times (default 10)
 petri runs                       # list saved runs
 petri inspect 3                  # show run #3's variable history
 petri compare 2 3                # diff what changed between two runs
+petri wipe                       # delete all runs (confirm twice)
 ```
 
 ### Example
