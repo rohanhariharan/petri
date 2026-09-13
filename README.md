@@ -1,10 +1,10 @@
-# petri
+![petri mark](assets/petri-wordmark.svg)
 
-Grow, observe, compare. *petri* instruments a Python program, records its
+*petri* instruments a Python program, records its
 variable state over time, saves each execution as a run, and tells you what
 actually changed between two experiments.
 
-![petri mark](assets/petri-mark.svg)
+![petri mark](assets/petri-.svg)
 
 Logo assets live in [`assets/`](assets/): `petri-mark.svg` (icon) and
 `petri-logo.svg` (icon + wordmark lockup).
