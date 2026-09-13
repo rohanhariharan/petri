@@ -4,6 +4,11 @@ Grow, observe, compare. *petri* instruments a Python program, records its
 variable state over time, saves each execution as a run, and tells you what
 actually changed between two experiments.
 
+![petri mark](assets/petri-mark.svg)
+
+Logo assets live in [`assets/`](assets/): `petri-mark.svg` (icon) and
+`petri-logo.svg` (icon + wordmark lockup).
+
 Single self-contained Python file, no dependencies, works with any Python 3.
 
 ## Install
