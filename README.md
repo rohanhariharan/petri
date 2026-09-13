@@ -18,6 +18,12 @@ curl -sL https://raw.githubusercontent.com/rohanhariharan/petri/main/petri \
   -o ~/bin/petri && chmod +x ~/bin/petri
 ```
 
+Or run the one-liner installer (defaults to `~/bin`, or `/usr/local/bin` under sudo):
+
+```sh
+curl -sL https://raw.githubusercontent.com/rohanhariharan/petri/main/install.sh | bash
+```
+
 Requires only a `python3` on your PATH.
 
 ## Usage
