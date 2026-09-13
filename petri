@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""
+petri - grow, observe, compare.
+
+Instrument a Python program, record its variable history over time, save each
+execution as a run, list / inspect runs, and compare what actually changed
+between two experiments.
+
+Single-file CLI. Requires only the Python stdlib. Stores data under ~/.petri.
+"""
+import ast
+import datetime
+import json
+import os
+import random
+import sys
+import time
+import traceback
+import uuid as uuidmod
+
+DATA_DIR = os.path.expanduser("~/.petri")
+RUNS_DIR = os.path.join(DATA_DIR, "runs")
+INDEX_FILE = os.path.join(DATA_DIR, "index.json")
+
+# ---------------------------------------------------------------------------
+# Value serialization
+# ---------------------------------------------------------------------------
+
+# Type names we understand and record. Anything else is skipped (or repr'd).
+SCALAR_TYPES = (int, float, str, bool, type(None))
+
+_MAX_DEPTH = 20
+
+
+def snapshot_value(value, depth=0):
+    """Produce a serializable, type-tagged snapshot of a value. Best effort.
+
+    Returns (typed dict, ok) where ok=False means "don't record this variable".
+    Unsupported types come back as a repr string so we don't silently lose them.
+    """
+    if isinstance(value, bool):
+        return {"type": "bool", "value": bool(value)}, True
+    if isinstance(value, int):
+        return {"type": "int", "value": int(value)}, True
+    if isinstance(value, float):
+        return {"type": "float", "value": float(value)}, True
+    if isinstance(value, str):
+        return {"type": "str", "value": str(value)}, True
+    if value is None:
+        return {"type": "None", "value": None}, True
+
+    if isinstance(value, list) or isinstance(value, tuple):
+        if depth >= _MAX_DEPTH:
+            return {"type": "list", "value": [repr(value)]}, True
+        items = []
+        for it in value:
+            snap, _ = snapshot_value(it, depth + 1)
+            items.append(snap)
+        return {"type": "list", "value": items}, True
+
+    if isinstance(value, dict):
+        if depth >= _MAX_DEPTH:
+            return {"type": "dict", "value": {"<repr>": repr(value)}}, True
+        items = {}
+        try:
+            iterable = value.items()
+        except AttributeError:
+            return {"type": "dict", "value": {"<repr>": repr(value)}}, True
+        for k, v in iterable:
+            vsnap, _ = snapshot_value(v, depth + 1)
+            if isinstance(k, str):
+                key = k
+            elif isinstance(k, (int, float, bool)) or k is None:
+                key = repr(k)
+            else:
+                key = repr(k)
+            items[key] = vsnap
+        return {"type": "dict", "value": items}, True
+
+    # Unsupported / arbitrary object. Keep it as a repr so the diff still works
+    # at a coarse level.
+    return {"type": "repr", "value": repr(value)}, False
+
+
+# ---------------------------------------------------------------------------
+# Recording target (runs inside the instrumented program)
+# ---------------------------------------------------------------------------
+
+class Recorder:
+    def __init__(self):
+        self.history = {}  # name -> list of {value, tick}
+
+    def record(self, name, value):
+        snap, ok = snapshot_value(value)
+        if not ok:
+            return
+        self.history.setdefault(name, []).append(
+            {"value": snap, "tick": len(self.history.get(name, []))}
+        )
+
+
+def _make_recorder_globals():
+    """Build a module globals dict injected into the instrumented program."""
+    g = dict(globals())
+    g["__lab_recorder"] = Recorder()
+    g["__lab_record"] = g["__lab_recorder"].record
+    return g
+
+
+# ---------------------------------------------------------------------------
+# AST instrumentation
+# ---------------------------------------------------------------------------
+
+class Instrumenter(ast.NodeTransformer):
+    """Wrap every module-level assignment with a recorder call.
+
+    target:
+
+        x = <value>
+
+    becomes:
+
+        x = <value>
+        __lab_record("x", x)
+    """
+
+    def visit_Assign(self, node):
+        super().generic_visit(node)  # transform nested exprs first
+        calls = []
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                call = ast.Expr(
+                    value=ast.Call(
+                        func=ast.Name(id="__lab_record", ctx=ast.Load()),
+                        args=[ast.Constant(value=target.id),
+                              ast.Name(id=target.id, ctx=ast.Load())],
+                        keywords=[],
+                    )
+                )
+                ast.copy_location(call, target)
+                calls.append(call)
+        if not calls:
+            return node
+        return [node] + calls
+
+    def visit_AnnAssign(self, node):
+        # x: int = 10  -> still an assignment we care about
+        if node.value is None:
+            return node
+        self.generic_visit(node)
+        if isinstance(node.target, ast.Name):
+            call = ast.Expr(
+                value=ast.Call(
+                    func=ast.Name(id="__lab_record", ctx=ast.Load()),
+                    args=[ast.Constant(value=node.target.id),
+                          ast.Name(id=node.target.id, ctx=ast.Load())],
+                    keywords=[],
+                )
+            )
+            ast.copy_location(call, node)
+            return [node, call]
+        return node
+
+
+def instrument_source(source):
+    """Parse source, instrument top-level assignments, return new source."""
+    tree = ast.parse(source)
+    tree = Instrumenter().visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
+# ---------------------------------------------------------------------------
+# Running a program
+# ---------------------------------------------------------------------------
+
+def run_program(path):
+    """Run `path`, return (recorder, duration_seconds).
+
+    Instrumentation and execution happen in this same process so that the
+    in-memory Recorder object is directly accessible afterwards — no IPC, no
+    temp files, no subprocess needed. The program's own imports/side effects
+    run as normal.
+    """
+    with open(path) as fh:
+        source = fh.read()
+    instrumented = instrument_source(source)
+
+    g = _make_recorder_globals()
+    g.setdefault("__name__", "__lab_main__")
+
+    start = time.monotonic()
+    failed = False
+    try:
+        exec(compile(instrumented, path, "exec"), g)
+    except SystemExit:
+        pass
+    except BaseException:
+        # Don't mask the program's failure; the run is still recorded.
+        failed = True
+        traceback.print_exc()
+    finally:
+        duration = time.monotonic() - start
+
+    return g["__lab_recorder"], duration, failed
+
+
+# ---------------------------------------------------------------------------
+# History -> plain dict (for storage / display)
+# ---------------------------------------------------------------------------
+
+def recorder_history_to_dict(recorder):
+    """Return {name: [typed-snap, ...]} preserving insertion order."""
+    out = {}
+    for name, entries in recorder.history.items():
+        out[name] = [e["value"] for e in entries]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Storage (JSON files + index)
+# ---------------------------------------------------------------------------
+
+def current_run_number():
+    if not os.path.isdir(RUNS_DIR):
+        return 1
+    numbers = []
+    for fn in os.listdir(RUNS_DIR):
+        try:
+            numbers.append(int(fn.split("-")[0]))
+        except (ValueError, IndexError):
+            continue
+    return (max(numbers) + 1) if numbers else 1
+
+
+def save_run(program, duration, history, failed=False):
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    number = current_run_number()
+    run_id = uuidmod.uuid4().hex
+    filename = "{}-{}.json".format(number, run_id)
+    run = {
+        "number": number,
+        "uuid": run_id,
+        "program": program,
+        "start": datetime.datetime.now().isoformat(timespec="seconds"),
+        "duration": duration,
+        "failed": failed,
+        "variables": history,
+        "variable_count": sum(len(v) for v in history.values()),
+    }
+    path = os.path.join(RUNS_DIR, filename)
+    with open(path, "w") as fh:
+        json.dump(run, fh, indent=2)
+    return number, path
+
+
+def load_run(number):
+    path = os.path.join(RUNS_DIR, "{}-*.json".format(number))
+    import glob
+    matches = glob.glob(path)
+    if not matches:
+        return None
+    with open(matches[0]) as fh:
+        return json.load(fh)
+
+
+def all_runs():
+    if not os.path.isdir(RUNS_DIR):
+        return []
+    runs = []
+    for fn in os.listdir(RUNS_DIR):
+        if not fn.endswith(".json"):
+            continue
+        with open(os.path.join(RUNS_DIR, fn)) as fh:
+            runs.append(json.load(fh))
+    runs.sort(key=lambda r: r["number"])
+    return runs
+
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+def fmt_seconds(seconds):
+    return "{:.2f}s".format(seconds)
+
+
+def fmt_value(snap, max_len=60):
+    def render(s, depth=0):
+        t = s["type"]
+        v = s["value"]
+        if t in ("int", "float", "str", "bool", "None"):
+            return json.dumps(v, ensure_ascii=False)
+        if t == "list":
+            return "[" + ", ".join(render(x, depth + 1) for x in v) + "]"
+        if t == "dict":
+            inner = ", ".join("{}: {}".format(json.dumps(k, ensure_ascii=False), render(x, depth + 1)) for k, x in v.items())
+            return "{" + inner + "}"
+        return repr(v)
+    text = render(snap)
+    if len(text) > max_len:
+        text = text[:max_len - 3] + "..."
+    return text
+
+
+def print_run_summary(run):
+    tag = " [FAILED]" if run.get("failed") else ""
+    print("Run #{}{}".format(run["number"], tag))
+    print("Program: {}".format(run["program"]))
+    print("Duration: {}".format(fmt_seconds(run["duration"])))
+    print("Variables recorded: {}".format(run["variable_count"]))
+    print()
+
+
+def print_runs(runs):
+    if not runs:
+        print("No runs yet. Run 'lab run <program.py>' to create one.")
+        return
+    header = "{:<4} {:<12} {:<10} {:<10}".format("ID", "Program", "Date", "Duration")
+    print(header)
+    print("-" * len(header))
+    for r in runs:
+        date = r["start"][:10]
+        failmark = "  (failed)" if r.get("failed") else ""
+        print("{:<4} {:<12} {:<10} {:<10}{}".format(
+            r["number"], r["program"], date, fmt_seconds(r["duration"]), failmark))
+
+
+def print_inspect(run):
+    print("Run #{}".format(run["number"]))
+    print("Program: {}".format(run["program"]))
+    print()
+    print("Variables")
+    print("-" * 30)
+    history = run.get("variables", {})
+    if not history:
+        print("(no variables recorded)")
+        return
+    for name, snaps in history.items():
+        print(name)
+        for snap in snaps:
+            print("  {}".format(fmt_value(snap)))
+
+
+def diff_histories(a, b):
+    """Compare two value histories (list of snaps). Returns (changed_lines, status).
+
+    status: "changed" if any position differs, else "unchanged" (including
+    when histories are empty/equal in length and equal in value).
+    """
+    changed = []
+    n = max(len(a), len(b))
+    changed_any = False
+    for i in range(n):
+        av = a[i] if i < len(a) else None
+        bv = b[i] if i < len(b) else None
+        if av == bv:
+            continue
+        changed_any = True
+        left = fmt_value(av) if av is not None else "(none)"
+        right = fmt_value(bv) if bv is not None else "(none)"
+        changed.append("{} → {}".format(left, right))
+    return changed, ("changed" if changed_any else "unchanged")
+
+
+def print_compare(run_a, run_b):
+    print("Comparing Run #{} → Run #{}".format(run_a["number"], run_b["number"]))
+    print()
+
+    ha = run_a.get("variables", {})
+    hb = run_b.get("variables", {})
+
+    changed_vars = {}
+    unchanged_vars = {}
+    added = {}
+    removed = {}
+
+    for name in ha:
+        if name in hb:
+            lines, status = diff_histories(ha[name], hb[name])
+            if status == "changed":
+                changed_vars[name] = lines
+            else:
+                unchanged_vars[name] = ha[name][-1]
+        else:
+            removed[name] = ha[name][-1]
+
+    for name in hb:
+        if name not in ha:
+            added[name] = hb[name][-1]
+
+    print("Changed variables")
+    print("-" * 30)
+    if not changed_vars:
+        print("(none)")
+    else:
+        for name, lines in changed_vars.items():
+            print(name)
+            for line in lines:
+                print("  {}".format(line))
+    print()
+
+    print("Unchanged")
+    print("-" * 30)
+    if not unchanged_vars:
+        print("(none)")
+    else:
+        for name, snap in unchanged_vars.items():
+            print("{} = {}".format(name, fmt_value(snap)))
+    print()
+
+    print("Added")
+    print("-" * 30)
+    if not added:
+        print("(none)")
+    else:
+        for name, snap in added.items():
+            print("{} = {}".format(name, fmt_value(snap)))
+    print()
+
+    print("Removed")
+    print("-" * 30)
+    if not removed:
+        print("(none)")
+    else:
+        for name, snap in removed.items():
+            print("{}".format(name))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def cmd_run(args):
+    if len(args) < 1:
+        print("usage: petri run <program.py>")
+        return 1
+    program = args[0]
+    if not os.path.isfile(program):
+        print("error: petri run: no such file: {}".format(program))
+        return 1
+
+    print("Running {}...".format(program))
+    recorder, duration, failed = run_program(program)
+    history = recorder_history_to_dict(recorder)
+    number, path = save_run(os.path.basename(program), duration, history, failed)
+
+    print()
+    print_run_summary({
+        "number": number,
+        "program": os.path.basename(program),
+        "duration": duration,
+        "variable_count": sum(len(v) for v in history.values()),
+    })
+    print("Run saved.")
+    return 1 if failed else 0
+
+
+def cmd_batch(args):
+    program = None
+    times = 10
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--times":
+            try:
+                times = int(args[i + 1])
+            except (IndexError, ValueError):
+                print("error: --times needs an integer")
+                return 1
+            i += 2
+            continue
+        if a.startswith("--times="):
+            try:
+                times = int(a.split("=", 1)[1])
+            except ValueError:
+                print("error: --times needs an integer")
+                return 1
+        else:
+            program = a
+        i += 1
+
+    if not program:
+        print("usage: petri batch <program.py> [--times N]")
+        return 1
+    if not os.path.isfile(program):
+        print("error: petri batch: no such file: {}".format(program))
+        return 1
+
+    print("Batching {} {} time(s)".format(program, times))
+    results = []
+    exit_code = 0
+    for n in range(1, times + 1):
+        print("\rlab is running... [run {}/{}]".format(n, times), end="", flush=True)
+        recorder, duration, failed = run_program(program)
+        history = recorder_history_to_dict(recorder)
+        num, path = save_run(os.path.basename(program), duration, history, failed)
+        if failed:
+            exit_code = 1
+        results.append((num, duration, sum(len(v) for v in history.values())))
+
+    print()
+    print()
+    print("{} run(s) saved.".format(len(results)))
+    for num, dur, vc in results:
+        print("  #{}  {}  {}".format(num, fmt_seconds(dur), vc))
+    return exit_code
+
+
+def cmd_runs(args):
+    print_runs(all_runs())
+
+
+def cmd_inspect(args):
+    if len(args) < 1:
+        print("usage: petri inspect <run number>")
+        return 1
+    try:
+        number = int(args[0])
+    except ValueError:
+        print("error: petri inspect: run number must be an integer")
+        return 1
+    run = load_run(number)
+    if not run:
+        print("error: petri inspect: no run #{}".format(number))
+        return 1
+    print_inspect(run)
+
+
+def cmd_compare(args):
+    if len(args) < 2:
+        print("usage: petri compare <run number A> <run number B>")
+        return 1
+    try:
+        a = int(args[0])
+        b = int(args[1])
+    except ValueError:
+        print("error: petri compare: run numbers must be integers")
+        return 1
+    run_a = load_run(a)
+    run_b = load_run(b)
+    if not run_a or not run_b:
+        print("error: petri compare: one or both runs not found ({} / {})".format(a, b))
+        return 1
+    print_compare(run_a, run_b)
+
+
+def main(argv):
+    if not argv:
+        print("""petri - grow, observe, compare
+
+usage:
+  petri run <program.py>                run once and record
+  petri batch <program.py> [--times N]  run N times (default 10)
+  petri runs                            list saved runs
+  petri inspect <run>                   show a run's variable history
+  petri compare <runA> <runB>           diff two runs
+
+help:
+  petri help""")
+        return 0
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd == "help":
+        return main([])
+    if cmd == "run":
+        return cmd_run(rest)
+    if cmd == "batch":
+        return cmd_batch(rest)
+    if cmd == "runs":
+        return cmd_runs(rest)
+    if cmd == "inspect":
+        return cmd_inspect(rest)
+    if cmd == "compare":
+        return cmd_compare(rest)
+
+    print("unknown command: {}".format(cmd))
+    return main([])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
