@@ -1,5 +1,6 @@
+<center>
 <img src="assets/petri-logo.svg" alt="Alt Text" width="100%">
-
+</center>
 *petri* instruments a Python program, records its
 variable state over time, saves each execution as a run, and tells you what
 actually changed between two experiments.
