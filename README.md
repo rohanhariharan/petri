@@ -1,7 +1,7 @@
 <center>
 <img src="assets/petri-logo.svg" alt="Alt Text" width="auto", height="auto">
 </center>
-*petri* instruments a Python program, records its
+<i>petri</i> instruments a Python program, records its
 variable state over time, saves each execution as a run, and tells you what
 actually changed between two experiments.
 
