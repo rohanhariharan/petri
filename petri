@@ -24,6 +24,8 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
+VERSION = "0.1.0"
+
 # ---------------------------------------------------------------------------
 # Value serialization
 # ---------------------------------------------------------------------------
@@ -1042,6 +1044,7 @@ usage:
   petri gram <runA> <runB>                      differential test (diff) two cultures
   petri incubate <program.py> <limit-ms>        time a run against a limit (ms)
   petri sterilize                               delete all cultures (confirm twice)
+  petri --version                               print version
 
 help:
   petri help""")
@@ -1049,6 +1052,10 @@ help:
 
     cmd = argv[0]
     rest = argv[1:]
+
+    if cmd in ("--version", "-V", "version"):
+        print("petri {}".format(VERSION))
+        return 0
 
     if cmd == "help":
         return main([])
