@@ -2,9 +2,9 @@
 """
 petri - grow, observe, compare.
 
-Instrument a Python program, record its variable history over time, save each
-execution as a run, list / inspect runs, and compare what actually changed
-between two experiments.
+Instrument a Python program, record its variable history over a run (a
+"culture"), save each culture, list / scope them, and run a differential Gram
+test (gram) to see what actually changed between two experiments.
 
 Single-file CLI. Requires only the Python stdlib. Stores data under ~/.petri.
 """
@@ -306,7 +306,7 @@ def fmt_value(snap, max_len=60):
 
 def print_run_summary(run):
     tag = " [FAILED]" if run.get("failed") else ""
-    print("Run #{}{}".format(run["number"], tag))
+    print("Culture #{}{}".format(run["number"], tag))
     print("Program: {}".format(run["program"]))
     print("Duration: {}".format(fmt_seconds(run["duration"])))
     print("Variables recorded: {}".format(run["variable_count"]))
@@ -315,7 +315,7 @@ def print_run_summary(run):
 
 def print_runs(runs):
     if not runs:
-        print("No runs yet. Run 'lab run <program.py>' to create one.")
+        print("No cultures yet. Run 'petri culture <program.py>' to grow one.")
         return
     header = "{:<4} {:<12} {:<10} {:<10}".format("ID", "Program", "Date", "Duration")
     print(header)
@@ -328,7 +328,7 @@ def print_runs(runs):
 
 
 def print_inspect(run):
-    print("Run #{}".format(run["number"]))
+    print("Culture #{}".format(run["number"]))
     print("Program: {}".format(run["program"]))
     print()
     print("Variables")
@@ -365,7 +365,7 @@ def diff_histories(a, b):
 
 
 def print_compare(run_a, run_b):
-    print("Comparing Run #{} → Run #{}".format(run_a["number"], run_b["number"]))
+    print("Gram stain of Culture #{} vs Culture #{}".format(run_a["number"], run_b["number"]))
     print()
 
     ha = run_a.get("variables", {})
@@ -390,7 +390,7 @@ def print_compare(run_a, run_b):
         if name not in ha:
             added[name] = hb[name][-1]
 
-    print("Changed variables")
+    print("Gram-positive (changed)")
     print("-" * 30)
     if not changed_vars:
         print("(none)")
@@ -401,7 +401,7 @@ def print_compare(run_a, run_b):
                 print("  {}".format(line))
     print()
 
-    print("Unchanged")
+    print("Gram-negative (unchanged)")
     print("-" * 30)
     if not unchanged_vars:
         print("(none)")
@@ -432,16 +432,16 @@ def print_compare(run_a, run_b):
 # CLI
 # ---------------------------------------------------------------------------
 
-def cmd_run(args):
+def cmd_culture(args):
     if len(args) < 1:
-        print("usage: petri run <program.py>")
+        print("usage: petri culture <program.py>")
         return 1
     program = args[0]
     if not os.path.isfile(program):
-        print("error: petri run: no such file: {}".format(program))
+        print("error: petri culture: no such file: {}".format(program))
         return 1
 
-    print("Running {}...".format(program))
+    print("Growing {}...".format(program))
     recorder, duration, failed = run_program(program)
     history = recorder_history_to_dict(recorder)
     number, path = save_run(os.path.basename(program), duration, history, failed)
@@ -453,7 +453,7 @@ def cmd_run(args):
         "duration": duration,
         "variable_count": sum(len(v) for v in history.values()),
     })
-    print("Run saved.")
+    print("Culture saved.")
     return 1 if failed else 0
 
 
@@ -488,11 +488,11 @@ def cmd_batch(args):
         print("error: petri batch: no such file: {}".format(program))
         return 1
 
-    print("Batching {} {} time(s)".format(program, times))
+    print("Culturing {} {} time(s)".format(program, times))
     results = []
     exit_code = 0
     for n in range(1, times + 1):
-        print("\rlab is running... [run {}/{}]".format(n, times), end="", flush=True)
+        print("\rpetri is culturing... [culture {}/{}]".format(n, times), end="", flush=True)
         recorder, duration, failed = run_program(program)
         history = recorder_history_to_dict(recorder)
         num, path = save_run(os.path.basename(program), duration, history, failed)
@@ -502,57 +502,57 @@ def cmd_batch(args):
 
     print()
     print()
-    print("{} run(s) saved.".format(len(results)))
+    print("{} culture(s) saved.".format(len(results)))
     for num, dur, vc in results:
         print("  #{}  {}  {}".format(num, fmt_seconds(dur), vc))
     return exit_code
 
 
-def cmd_runs(args):
+def cmd_plate(args):
     print_runs(all_runs())
 
 
-def cmd_inspect(args):
+def cmd_scope(args):
     if len(args) < 1:
-        print("usage: petri inspect <run number>")
+        print("usage: petri scope <run number>")
         return 1
     try:
         number = int(args[0])
     except ValueError:
-        print("error: petri inspect: run number must be an integer")
+        print("error: petri scope: run number must be an integer")
         return 1
     run = load_run(number)
     if not run:
-        print("error: petri inspect: no run #{}".format(number))
+        print("error: petri scope: no run #{}".format(number))
         return 1
     print_inspect(run)
 
 
-def cmd_compare(args):
+def cmd_gram(args):
     if len(args) < 2:
-        print("usage: petri compare <run number A> <run number B>")
+        print("usage: petri gram <run number A> <run number B>")
         return 1
     try:
         a = int(args[0])
         b = int(args[1])
     except ValueError:
-        print("error: petri compare: run numbers must be integers")
+        print("error: petri gram: run numbers must be integers")
         return 1
     run_a = load_run(a)
     run_b = load_run(b)
     if not run_a or not run_b:
-        print("error: petri compare: one or both runs not found ({} / {})".format(a, b))
+        print("error: petri gram: one or both runs not found ({} / {})".format(a, b))
         return 1
     print_compare(run_a, run_b)
 
 
-def cmd_wipe(args):
+def cmd_sterilize(args):
     if not os.path.isdir(RUNS_DIR):
-        print("nothing to wipe: no runs exist")
+        print("nothing to sterilize: no cultures exist")
         return 0
 
     n = len(all_runs())
-    print("This will permanently delete all {} saved run(s).".format(n))
+    print("This will permanently delete all {} saved culture(s).".format(n))
 
     for _ in range(2):
         answer = input('Type "yes" to confirm: ').strip().lower()
@@ -565,22 +565,22 @@ def cmd_wipe(args):
         if os.path.isfile(p):
             os.remove(p)
     os.rmdir(RUNS_DIR)
-    print("All {} run(s) wiped.".format(n))
+    print("All {} culture(s) sterilized.".format(n))
     return 0
 
 
-def cmd_timer(args):
+def cmd_incubate(args):
     if len(args) < 2:
-        print("usage: petri timer <program.py> <limit-ms>")
+        print("usage: petri incubate <program.py> <limit-ms>")
         return 1
     program, limit_str = args[0], args[1]
     if not os.path.isfile(program):
-        print("error: petri timer: no such file: {}".format(program))
+        print("error: petri incubate: no such file: {}".format(program))
         return 1
     try:
         limit_ms = int(limit_str)
     except ValueError:
-        print("error: petri timer: limit must be an integer (milliseconds)")
+        print("error: petri incubate: limit must be an integer (milliseconds)")
         return 1
 
     RED = "\033[0;31m"
@@ -593,7 +593,7 @@ def cmd_timer(args):
             [sys.executable, program], capture_output=True, text=True
         )
     except OSError as e:
-        print("error: petri timer: could not run: {}".format(e))
+        print("error: petri incubate: could not run: {}".format(e))
         return 1
     elapsed_ms = (time.monotonic() - start) * 1000
     diff_ms = elapsed_ms - limit_ms
@@ -621,13 +621,13 @@ def main(argv):
         print("""petri - grow, observe, compare
 
 usage:
-  petri run <program.py>                run once and record
-  petri batch <program.py> [--times N]  run N times (default 10)
-  petri runs                            list saved runs
-  petri inspect <run>                   show a run's variable history
-  petri compare <runA> <runB>           diff two runs
-  petri timer <program.py> <limit-ms>   time a run against a limit (ms)
-  petri wipe                            delete all runs (confirm twice)
+  petri culture <program.py>              grow a run and record variables
+  petri batch <program.py> [--times N]    grow N runs (default 10)
+  petri plate                             list all cultures (runs)
+  petri scope <run>                       observe a culture's variable history
+  petri gram <runA> <runB>                differential test (diff) two cultures
+  petri incubate <program.py> <limit-ms>  time a run against a limit (ms)
+  petri sterilize                         delete all cultures (confirm twice)
 
 help:
   petri help""")
@@ -638,20 +638,20 @@ help:
 
     if cmd == "help":
         return main([])
-    if cmd == "run":
-        return cmd_run(rest)
+    if cmd == "culture":
+        return cmd_culture(rest)
     if cmd == "batch":
         return cmd_batch(rest)
-    if cmd == "runs":
-        return cmd_runs(rest)
-    if cmd == "inspect":
-        return cmd_inspect(rest)
-    if cmd == "compare":
-        return cmd_compare(rest)
-    if cmd == "wipe":
-        return cmd_wipe(rest)
-    if cmd == "timer":
-        return cmd_timer(rest)
+    if cmd == "plate":
+        return cmd_plate(rest)
+    if cmd == "scope":
+        return cmd_scope(rest)
+    if cmd == "gram":
+        return cmd_gram(rest)
+    if cmd == "sterilize":
+        return cmd_sterilize(rest)
+    if cmd == "incubate":
+        return cmd_incubate(rest)
 
     print("unknown command: {}".format(cmd))
     return main([])

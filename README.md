@@ -28,19 +28,22 @@ Requires only a `python3` on your PATH.
 
 ## Usage
 
+The language is the lab: you *grow* a culture, *plate* your dishes, *scope* a
+sample, and run a differential *Gram test* to compare.
+
 ```sh
-petri run main.py                # run once, record variables
-petri batch main.py --times 10   # run N times (default 10)
-petri runs                       # list saved runs
-petri inspect 3                  # show run #3's variable history
-petri compare 2 3                # diff what changed between two runs
-petri timer main.py 500          # time a run against a 500 ms limit
-petri wipe                       # delete all runs (confirm twice)
+petri culture main.py          # grow a run, record variables
+petri batch main.py --times 10 # grow N cultures (default 10)
+petri plate                    # list all cultures
+petri scope 3                  # observe culture #3's variable history
+petri gram 2 3                 # differential test (diff) two cultures
+petri incubate main.py 500     # time a run against a 500 ms limit
+petri sterilize                # delete all cultures (confirm twice)
 ```
 
-`petri timer` runs the file as a real subprocess (no instrumentation) and exits
-`0` if it finished within the limit (green), or `1` if it exceeded it (red) —
-including if the program itself errored.
+`petri incubate` runs the file as a real subprocess (no instrumentation) and
+exits `0` if it finished within the limit (green), or `1` if it exceeded it
+(red) — including if the program itself errored.
 
 ### Example
 
@@ -63,12 +66,12 @@ y:    5
 z:    15 → 25
 ```
 
-`petri compare 2 3` shows what actually changed across runs:
+`petri gram 2 3` is the differential test — what changed between two cultures:
 
 ```
-Changing Run #2 → Run #3
+Gram stain of Culture #2 vs Culture #3
 
-Changed variables
+Gram-positive (changed)
 ────────────────────────
 x
   10 → 20
