@@ -25,7 +25,7 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 # --- self-update / freshness -------------------------------------------------
 REPO = "rohanhariharan/petri"
@@ -798,8 +798,39 @@ _PLATE_COLORS = [
 ]
 
 
+def _reset():
+    return "\033[0m" if _color_enabled() else ""
+
+
+def _color_enabled():
+    """True when we should emit ANSI color: a TTY and not disabled."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    return True
+
+
 def _ansi256(rgb, bg=False):
     """Map an (r,g,b) triplet to the closest xterm 256-color code."""
+    best = None
+    best_d = 1e9
+    for code in range(16, 256):
+        if 232 <= code <= 255:
+            t = (code - 232) * 10 + 8
+            r = g = b = t
+        else:
+            v = code - 16
+            r = ((v // 36) % 6) * 51
+            g = ((v // 6) % 6) * 51
+            b = (v % 6) * 51
+        d = (rgb[0] - r) ** 2 + (rgb[1] - g) ** 2 + (rgb[2] - b) ** 2
+        if d < best_d:
+            best_d = d
+            best = code
+    if not _color_enabled():
+        return ""
+    return "\033[{};5;{}m".format(48 if bg else 38, best)
     best = None
     best_d = 1e9
     for code in range(16, 256):
@@ -833,7 +864,7 @@ def _colony_bg(run_idx):
 def _draw_dish(title, cultures, well_color=""):
     """Draw one well as an ASCII petri dish ring, one colored colony per culture."""
     R = 4
-    RESET = "\033[0m"
+    RESET = _reset()
     w = 2 * R + 1
     rim = "    " + ("o" + " " * w + "o")
     inner = "    " + " " + ("o" + " " * (w - 2) + "o")
@@ -871,7 +902,7 @@ def _draw_dish(title, cultures, well_color=""):
 
 
 def render_agar(runs):
-    RESET = "\033[0m"
+    RESET = _reset()
     total_bytes = 0
     for fn in os.listdir(RUNS_DIR):
         p = os.path.join(RUNS_DIR, fn)
@@ -1210,10 +1241,9 @@ def cmd_incubate(args):
         print("error: petri incubate: limit must be an integer (milliseconds)")
         return 1
 
-    RED = "\033[0;31m"
-    GREEN = "\033[0;32m"
-    RESET = "\033[0m"
-
+    RED = "\033[0;31m" if _color_enabled() else ""
+    GREEN = "\033[0;32m" if _color_enabled() else ""
+    RESET = _reset()
     start = time.monotonic()
     try:
         result = subprocess.run(
@@ -1298,7 +1328,7 @@ def cmd_evolve(args):
 
 def main(argv):
     if not argv:
-        print("""petri - grow, observe, compare
+        print("""petri - grow, observe, compare (v{version})
 
 usage:
   petri agar [status] [path] [export <dest.tar>] [import <arch.tar>]  manage the workspace
@@ -1314,8 +1344,7 @@ usage:
   petri --version                               print version
 
 help:
-  petri help""")
-        return 0
+  petri help""".format(version=VERSION))
 
     cmd = argv[0]
     rest = argv[1:]
