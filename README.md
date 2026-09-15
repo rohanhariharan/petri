@@ -45,6 +45,7 @@ petri culture main.py                    # grow a run, record variables
 petri culture main.py --well baseline     # grow a run into a named well
 petri culture main.py --track config     # record only matching variables
 petri culture main.py --ignore *_iter    # skip matching variables
+petri culture main.py --classes          # also record class instance attributes (self.x)
 petri batch main.py --times 10           # grow N cultures (default 10)
 petri plate                              # list all cultures
 petri plate --well sweep                 # list cultures in one well
@@ -68,6 +69,11 @@ them.
 
 `--track` / `--ignore` filter which variables get recorded; both accept
 comma-separated exact names or `*` wildcards (e.g. `--ignore foo_*`).
+
+`--classes` additionally records **class instance attributes** (`self.attr`
+assignments and `self.attr += ...` in methods) and class-body attribute
+definitions, keyed under their class name, e.g. `Counter.count`. Use it with
+`culture` or `batch`. Without it, attributes are left untracked.
 
 `petri incubate` runs the file as a real subprocess (no instrumentation) and
 exits `0` if it finished within the limit (green), or `1` if it exceeded it
@@ -132,19 +138,24 @@ y                       2      1            4    +80.00%
 
 ## What it records
 
-Top-level variables (assignments) with basic Python values:
+Assignments — and augmented assignments like `x += 1` — with basic Python values:
 
 integers · floats · strings · booleans · lists · dictionaries · tuples · `None`
 
+Assignments are instrumented in **any** scope, including inside functions and
+loop bodies, so a counter that increments in a loop records every step. With
+`--classes`, `self.attr` (instance) attributes and class-body attributes are
+also recorded, keyed under `ClassName.attr`.
+
 Each recorded change also carries a **millisecond timestamp** (elapsed since the
-run started), shown by `petri scope`. Function locals, imports, and class bodies
-are left untracked for now. Arbitrary objects are skipped rather than crash the
-run.
+run started), shown by `petri scope`. Imports and local variables of uncalled
+functions aren't tracked for now (functions are only recorded when they run).
+Arbitrary objects are skipped rather than crash the run.
 
 ## How it works
 
-`petri` rewrites top-level assignments using Python's standard `ast` module,
-wrapping each with a recorder call. The instrumented program runs as a real
+`petri` rewrites assignments using Python's standard `ast` module, wrapping each
+with a recorder call. The instrumented program runs as a real
 **subprocess** (`python <program>`), so `os._exit()`, `quit()`, `if __name__ ==
 "__main__"`, and `sys.argv` all behave exactly like a normal invocation. The
 recorder appends each change to a JSONL log the instant it happens — so even a
@@ -153,7 +164,9 @@ hard `os._exit()` leaves the captured state on disk. Runs are saved under
 
 ## Known limitations
 
-- Top-level only — functions aren't instrumented yet.
+- Attributes are off by default; pass `--classes` to record them.
+- Function locals are only captured when the function actually runs (it's real
+  execution, not static analysis).
 - `petri incubate` times a run as a subprocess but doesn't instrument it.
 
 ## License
