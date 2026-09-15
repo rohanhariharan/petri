@@ -18,13 +18,54 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.request
 import uuid as uuidmod
 
 DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+
+# --- self-update / freshness -------------------------------------------------
+REPO = "rohanhariharan/petri"
+RAW_UPDATE_URL = "https://raw.githubusercontent.com/{}/main/petri".format(REPO)
+API_RELEASES_URL = "https://api.github.com/repos/{}/releases/latest".format(REPO)
+
+
+def _parse_version(s):
+    parts = []
+    for p in (s or "").strip("v").split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def latest_version():
+    """Return the newest petri version tag string, or None if unreachable."""
+    try:
+        with urllib.request.urlopen(API_RELEASES_URL, timeout=4) as r:
+            data = json.load(r)
+        return data.get("tag_name") or data.get("name")
+    except Exception:
+        return None
+
+
+def check_for_update(silent=False):
+    """Warn (once per command) if a newer version of petri exists."""
+    latest = latest_version()
+    if not latest:
+        return
+    if _parse_version(latest) > _parse_version(VERSION):
+        print("your cultures need new substrate — upgrade, please! "
+              "({} → {}) run: petri evolve".format(VERSION, latest),
+              file=sys.stderr)
+        return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Value serialization
@@ -1136,6 +1177,48 @@ def cmd_incubate(args):
         return 1
 
 
+def cmd_evolve(args):
+    """Update petri to the latest version in place."""
+    self_path = os.path.abspath(sys.argv[0])
+    my_version = _parse_version(VERSION)
+
+    # find the latest release
+    latest = latest_version()
+    if not latest:
+        print("could not reach the substrate feed — check your network connection")
+        return 1
+    if _parse_version(latest) <= my_version:
+        print("your culture is already the latest strain (petri {}).".format(VERSION))
+        return 0
+
+    target = os.path.realpath(self_path)
+    if not os.access(target, os.W_OK):
+        print("petri {} → {} available.".format(VERSION, latest))
+        print("this install is not writable — rerun with:  sudo petri evolve")
+        return 1
+
+    print("evolving petri {} → {} ...".format(VERSION, latest))
+    try:
+        with urllib.request.urlopen(RAW_UPDATE_URL, timeout=15) as r:
+            new_body = r.read()
+    except Exception as e:
+        print("download failed: {}".format(e))
+        return 1
+
+    tmp = target + ".new"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(new_body)
+        os.chmod(tmp, os.stat(target).st_mode)
+        os.replace(tmp, target)
+    except OSError as e:
+        print("could not write update: {}".format(e))
+        return 1
+    print("evolved! you are now running petri {}.".format(latest))
+    print("note: run '{} --version' to confirm.".format(target))
+    return 0
+
+
 def main(argv):
     if not argv:
         print("""petri - grow, observe, compare
@@ -1150,6 +1233,7 @@ usage:
   petri cfu <runA> <runB>                       numeric change measure per variable
   petri incubate <program.py> <limit-ms>        time a run against a limit (ms)
   petri sterilize                               delete all cultures (confirm twice)
+  petri evolve                                  update petri to the latest version
   petri --version                               print version
 
 help:
@@ -1165,6 +1249,12 @@ help:
 
     if cmd == "help":
         return main([])
+    if cmd == "evolve":
+        return cmd_evolve(rest)
+
+    # on every real command, warn if petri is outdated
+    check_for_update()
+
     if cmd == "agar":
         return cmd_agar(rest)
     if cmd == "culture":

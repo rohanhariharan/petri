@@ -53,6 +53,7 @@ petri gram 2 3                           # differential test (diff) two cultures
 petri cfu 2 3                            # numeric change measure per variable
 petri incubate main.py 500               # time a run against a 500 ms limit
 petri sterilize                          # delete all cultures (confirm twice)
+petri evolve                             # update petri to the latest version
 ```
 
 `petri agar` is the lab's substrate — the workspace every culture grows on. Use
@@ -71,6 +72,13 @@ comma-separated exact names or `*` wildcards (e.g. `--ignore foo_*`).
 `petri incubate` runs the file as a real subprocess (no instrumentation) and
 exits `0` if it finished within the limit (green), or `1` if it exceeded it
 (red) — including if the program itself errored.
+
+`petri evolve` updates petri in place. When you're on an older version, every
+command prints a friendly nudge —
+*"your cultures need new substrate — upgrade, please! ... run: petri evolve"* —
+and `petri evolve` fetches the latest release and swaps the binary in. If the
+installed file isn't writable (e.g. owned by root), rerun with `sudo petri
+evolve`.
 
 ### Example
 
