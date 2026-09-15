@@ -25,7 +25,7 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # --- self-update / freshness -------------------------------------------------
 REPO = "rohanhariharan/petri"
