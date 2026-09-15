@@ -25,12 +25,20 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # --- self-update / freshness -------------------------------------------------
 REPO = "rohanhariharan/petri"
-RAW_UPDATE_URL = "https://raw.githubusercontent.com/{}/main/petri".format(REPO)
 API_RELEASES_URL = "https://api.github.com/repos/{}/releases/latest".format(REPO)
+
+
+def tag_download_url(tag):
+    """Fetch the petri binary from an exact release tag (never from main).
+
+    Using the tag guarantees the announced version always matches the bytes we
+    write — main can lag a freshly-cut release behind the CDN cache.
+    """
+    return "https://raw.githubusercontent.com/{}/{}/petri".format(REPO, tag)
 
 
 def _parse_version(s):
@@ -43,6 +51,19 @@ def _parse_version(s):
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts[:3])
+
+
+def _body_version(body):
+    """Extract the VERSION constant from downloaded petri source bytes."""
+    try:
+        for line in body[:2000].decode("utf-8", "ignore").splitlines():
+            line = line.strip()
+            if line.startswith("VERSION"):
+                val = line.split("=", 1)[-1].strip().strip('"').strip("'")
+                return val
+    except Exception:
+        pass
+    return None
 
 
 def latest_version():
@@ -1187,6 +1208,10 @@ def cmd_evolve(args):
     if not latest:
         print("could not reach the substrate feed — check your network connection")
         return 1
+    # normalize the tag to a bare URL-safe tag (e.g. 'v0.3.1')
+    latest_tag = latest.strip().strip("+")
+    if not latest_tag.startswith("v"):
+        latest_tag = "v" + latest_tag
     if _parse_version(latest) <= my_version:
         print("your culture is already the latest strain (petri {}).".format(VERSION))
         return 0
@@ -1199,10 +1224,17 @@ def cmd_evolve(args):
 
     print("evolving petri {} → {} ...".format(VERSION, latest))
     try:
-        with urllib.request.urlopen(RAW_UPDATE_URL, timeout=15) as r:
+        with urllib.request.urlopen(tag_download_url(latest_tag), timeout=15) as r:
             new_body = r.read()
     except Exception as e:
         print("download failed: {}".format(e))
+        return 1
+    # sanity check: the fetched binary should carry a version newer than ours,
+    # otherwise the CDN served us stale bytes and we shouldn't clobber the file
+    fetched_version = _body_version(new_body)
+    if _parse_version(fetched_version) <= my_version:
+        print("downloaded strain looks stale (petri {}); try again shortly.".format(
+            fetched_version or "?"))
         return 1
 
     tmp = target + ".new"
