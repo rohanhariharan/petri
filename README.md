@@ -49,9 +49,13 @@ petri culture main.py --classes          # also record class instance attributes
 petri batch main.py --times 10           # grow N cultures (default 10)
 petri plate                              # list all cultures
 petri plate --well sweep                 # list cultures in one well
+petri plate --json                       # machine-readable plate (list of runs)
 petri scope 3                            # observe culture #3's variable history
+petri scope 3 --json                     # full run, machine-readable
 petri gram 2 3                           # differential test (diff) two cultures
+petri gram 2 3 --json                     # machine-readable gram
 petri cfu 2 3                            # numeric change measure per variable
+petri cfu 2 3 --json                     # machine-readable cfu
 petri incubate main.py 500               # time a run against a 500 ms limit
 petri sterilize                          # delete all cultures (confirm twice)
 petri evolve                             # update petri to the latest version
@@ -140,17 +144,32 @@ y                       2      1            4    +80.00%
 
 Assignments — and augmented assignments like `x += 1` — with basic Python values:
 
-integers · floats · strings · booleans · lists · dictionaries · tuples · `None`
+integers · floats · strings · booleans · lists · dictionaries · sets · tuples · `None`
 
-Assignments are instrumented in **any** scope, including inside functions and
-loop bodies, so a counter that increments in a loop records every step. With
-`--classes`, `self.attr` (instance) attributes and class-body attributes are
-also recorded, keyed under `ClassName.attr`.
+Plus, when numpy is already imported by the program: **numpy arrays** (with `dtype`
+and `shape`). Assignments are instrumented in **any** scope, including inside
+functions and loop bodies, so a counter that increments in a loop records every
+step. With `--classes`, `self.attr` (instance) attributes and class-body
+attributes are also recorded, keyed under `ClassName.attr`.
 
 Each recorded change also carries a **millisecond timestamp** (elapsed since the
 run started), shown by `petri scope`. Imports and local variables of uncalled
 functions aren't tracked for now (functions are only recorded when they run).
 Arbitrary objects are skipped rather than crash the run.
+
+## Machine-readable output
+
+`petri plate/scope/gram/cfu` accept `--json` for stable, structured output —
+handy for tooling, scripts, and AI consumers. Every saved run also carries
+`schema_version` and `petri_version`, so consumers can version against the data
+shape.
+
+```sh
+petri plate --json        # list of runs
+petri scope 3 --json      # full run (variables + timestamps)
+petri gram 2 3 --json     # changed / unchanged / added / removed
+petri cfu 2 3 --json      # per-variable numeric metrics
+```
 
 ## How it works
 
@@ -165,6 +184,7 @@ hard `os._exit()` leaves the captured state on disk. Runs are saved under
 ## Known limitations
 
 - Attributes are off by default; pass `--classes` to record them.
+- numpy `ndarray`s are only snapshotted if the program imports numpy (zero-dependency: petri never imports it itself).
 - Function locals are only captured when the function actually runs (it's real
   execution, not static analysis).
 - `petri incubate` times a run as a subprocess but doesn't instrument it.

@@ -25,7 +25,8 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
+RUN_SCHEMA = 3
 
 # --- self-update / freshness -------------------------------------------------
 REPO = "rohanhariharan/petri"
@@ -170,7 +171,7 @@ def snapshot_value(value, depth=0):
         return {"type": "list", "value": items}, True
 
     if isinstance(value, dict):
-        if depth >= _MAX_DEPTH:
+        if depth >= _MAX:
             return {"type": "dict", "value": {"<repr>": repr(value)}}, True
         items = {}
         try:
@@ -187,6 +188,22 @@ def snapshot_value(value, depth=0):
                 key = repr(k)
             items[key] = vsnap
         return {"type": "dict", "value": items}, True
+
+    if isinstance(value, set) and not isinstance(value, frozenset):
+        if depth >= _MAX:
+            return {"type": "set", "value": [repr(x) for x in value]}, True
+        try:
+            ordered = sorted(value)
+        except TypeError:
+            ordered = list(value)
+        return {"type": "set",
+                "value": [snapshot_value(x, depth + 1)[0] for x in ordered]}, True
+
+    np = sys.modules.get("numpy")
+    if np is not None and isinstance(value, np.ndarray):
+        return {"type": "array", "dtype": str(value.dtype),
+                "shape": list(value.shape),
+                "value": snapshot_value(value.tolist(), depth + 1)[0]}, True
 
     # Unsupported / arbitrary object. Keep it as a repr so the diff still works
     # at a coarse level.
@@ -232,6 +249,11 @@ def _allowed(name):
         return False
     return True
 
+def _numpy_mod():
+    # Resolve numpy from sys.modules if the program already imported it, so we
+    # never pay an import cost (petri stays zero-dependency).
+    return sys.modules.get('numpy')
+
 def _snapshot(value, depth=0):
     _MAX = 20
     if isinstance(value, bool):
@@ -260,6 +282,20 @@ def _snapshot(value, depth=0):
             kk = k if isinstance(k, str) else repr(k)
             out[kk] = _snapshot(v, depth + 1)
         return {"type": "dict", "value": out}
+    if isinstance(value, set) and not isinstance(value, frozenset):
+        if depth >= _MAX:
+            return {"type": "set", "value": [repr(x) for x in value]}
+        try:
+            ordered = sorted(value)
+        except TypeError:
+            ordered = list(value)
+        return {"type": "set", "value": [_snapshot(x, depth + 1) for x in ordered]}
+    np = _numpy_mod()
+    if np is not None and isinstance(value, np.ndarray):
+        # numpy arrays: keep dtype + shape so diffs / AI can reason about them.
+        return {"type": "array", "dtype": str(value.dtype),
+                "shape": list(value.shape),
+                "value": _snapshot(value.tolist(), depth + 1)}
     return None
 
 def __lab_record(name, value):
@@ -530,6 +566,8 @@ def save_run(program, duration, history, failed=False, well=None):
     run_id = uuidmod.uuid4().hex
     filename = "{}-{}.json".format(number, run_id)
     run = {
+        "schema_version": RUN_SCHEMA,
+        "petri_version": VERSION,
         "number": number,
         "uuid": run_id,
         "program": program,
@@ -577,18 +615,26 @@ def fmt_seconds(seconds):
     return "{:.2f}s".format(seconds)
 
 
+def emit_json(obj):
+    """Print `obj` as compact, stable JSON (machine-readable output)."""
+    print(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+
+
 def fmt_value(snap, max_len=60):
     def render(s, depth=0):
         t = s["type"]
-        v = s["value"]
         if t in ("int", "float", "str", "bool", "None"):
-            return json.dumps(v, ensure_ascii=False)
+            return json.dumps(s["value"], ensure_ascii=False)
         if t == "list":
-            return "[" + ", ".join(render(x, depth + 1) for x in v) + "]"
+            return "[" + ", ".join(render(x, depth + 1) for x in s["value"]) + "]"
         if t == "dict":
-            inner = ", ".join("{}: {}".format(json.dumps(k, ensure_ascii=False), render(x, depth + 1)) for k, x in v.items())
+            inner = ", ".join("{}: {}".format(json.dumps(k, ensure_ascii=False), render(x, depth + 1)) for k, x in s["value"].items())
             return "{" + inner + "}"
-        return repr(v)
+        if t == "set":
+            return "{" + ", ".join(render(x, depth + 1) for x in s["value"]) + "}"
+        if t == "array":
+            return render(s["value"], depth + 1) if s.get("value") else "[]"
+        return repr(s["value"])
     text = render(snap)
     if len(text) > max_len:
         text = text[:max_len - 3] + "..."
@@ -669,7 +715,8 @@ def diff_histories(a, b):
 
 
 def _same_container_type(x, y):
-    return x.get("type") in ("list", "dict") and x.get("type") == y.get("type")
+    return x.get("type") in ("list", "dict", "array", "set") \
+        and x.get("type") == y.get("type")
 
 
 def _final_numeric(snap):
@@ -727,14 +774,27 @@ def _fmt_num(x):
     return "{:.4g}".format(x)
 
 
-def print_cfu(run_a, run_b):
-    print("CFU of Culture #{} vs Culture #{}".format(run_a["number"], run_b["number"]))
-    print("(colony-forming units — a numeric measure of change)")
-    print()
-
+def build_cfu_table(run_a, run_b):
+    """Structured CFU table: {variables: {name: metrics}, ...}."""
     ha = run_a.get("variables", {})
     hb = run_b.get("variables", {})
     names = sorted(set(list(ha.keys()) + list(hb.keys())))
+    variables = {}
+    for name in names:
+        variables[name] = cfu_metrics(ha.get(name), hb.get(name))
+    return {"culture_a": run_a["number"], "culture_b": run_b["number"],
+            "variables": variables}
+
+
+def print_cfu(run_a, run_b):
+    data = build_cfu_table(run_a, run_b)
+    ha = run_a.get("variables", {})
+    hb = run_b.get("variables", {})
+    names = sorted(set(list(ha.keys()) + list(hb.keys())))
+
+    print("CFU of Culture #{} vs Culture #{}".format(run_a["number"], run_b["number"]))
+    print("(colony-forming units — a numeric measure of change)")
+    print()
 
     if not names:
         print("(no variables to compare)")
@@ -745,8 +805,7 @@ def print_cfu(run_a, run_b):
         "Variable", "CFU", "Δpos", "Δ magnitude", "Δ %")
     print(header)
     print("-" * len(header))
-    for name in names:
-        m = cfu_metrics(ha.get(name), hb.get(name))
+    for name, m in data["variables"].items():
         del_show = _fmt_num(m["delta"]) if m["delta"] is not None else "-"
         pct_show = ("{:+.2f}%".format(m["pct"]) if m["pct"] is not None else "-")
         print("{:<18} {:>6} {:>6} {:>12} {:>10}".format(
@@ -763,8 +822,12 @@ def deep_value_diff(a, b, path=""):
     """Return lines describing fine-grained differences inside list/dict values.
 
     `a`, `b` are typed snapshots (dicts with "type"/"value"). Produces lines
-    like "config['lr']: 0.1 → 0.01" or "items[1]: 2 → 9".
+    like "config['lr']: 0.1 → 0.01" or "items[1]: 2 → 9". numpy arrays are
+    unwrapped to their element list so element-wise changes are reported.
     """
+    if a["type"] == "array" or b["type"] == "array":
+        a = a.get("value", {"type": "list", "value": []}) if a["type"] == "array" else a
+        b = b.get("value", {"type": "list", "value": []}) if b["type"] == "array" else b
     if a["type"] == "list" and b["type"] == "list":
         out = []
         n = max(len(a["value"]), len(b["value"]))
@@ -806,30 +869,14 @@ def deep_value_diff(a, b, path=""):
 
 
 def print_compare(run_a, run_b):
+    data = build_gram(run_a, run_b)
     print("Gram stain of Culture #{} vs Culture #{}".format(run_a["number"], run_b["number"]))
     print()
 
-    ha = run_a.get("variables", {})
-    hb = run_b.get("variables", {})
-
-    changed_vars = {}
-    unchanged_vars = {}
-    added = {}
-    removed = {}
-
-    for name in ha:
-        if name in hb:
-            lines, status = diff_histories(ha[name], hb[name])
-            if status == "changed":
-                changed_vars[name] = lines
-            else:
-                unchanged_vars[name] = ha[name][-1]["v"]
-        else:
-            removed[name] = ha[name][-1]["v"]
-
-    for name in hb:
-        if name not in ha:
-            added[name] = hb[name][-1]["v"]
+    changed_vars = data["changed"]
+    unchanged_vars = data["unchanged"]
+    added = data["added"]
+    removed = data["removed"]
 
     print("Gram-positive (changed)")
     print("-" * 30)
@@ -867,6 +914,34 @@ def print_compare(run_a, run_b):
     else:
         for name, snap in removed.items():
             print("{}".format(name))
+
+
+def build_gram(run_a, run_b):
+    """Structured Gram result: {changed, unchanged, added, removed}.
+
+    Each maps variable name -> info. changed values are lists of diff lines;
+    unchanged/added/removed are typed snapshots of the terminal value.
+    """
+    ha = run_a.get("variables", {})
+    hb = run_b.get("variables", {})
+    changed_vars = {}
+    unchanged_vars = {}
+    added = {}
+    removed = {}
+    for name in ha:
+        if name in hb:
+            lines, status = diff_histories(ha[name], hb[name])
+            if status == "changed":
+                changed_vars[name] = lines
+            else:
+                unchanged_vars[name] = ha[name][-1]["v"]
+        else:
+            removed[name] = ha[name][-1]["v"]
+    for name in hb:
+        if name not in ha:
+            added[name] = hb[name][-1]["v"]
+    return {"changed": changed_vars, "unchanged": unchanged_vars,
+            "added": added, "removed": removed}
 
 
 # ---------------------------------------------------------------------------
@@ -1237,22 +1312,42 @@ def cmd_batch(args):
 
 def cmd_plate(args):
     runs = all_runs()
+    as_json = False
+    filtered = False
+    if args and (args[0] == "--json"):
+        as_json = True
+        args = args[1:]
     if args and (args[0] == "--well" or args[0].startswith("--well=")):
         if args[0].startswith("--well="):
             well = args[0].split("=", 1)[1]
+            filtered = True
         else:
             well = args[1] if len(args) > 1 else None
+            filtered = True
         if well is not None:
             runs = [r for r in runs if r.get("well") == well]
+    if as_json:
+        emit_json({"command": "plate",
+                   "well": well if filtered else None,
+                   "runs": [{k: r.get(k) for k in
+                             ("number", "well", "program", "start", "duration",
+                              "failed", "variable_count", "schema_version")}
+                            for r in runs]})
+        return 0
     print_runs(runs)
 
 
 def cmd_scope(args):
-    if len(args) < 1:
+    if not args:
+        print("usage: petri scope <run number>")
+        return 1
+    as_json = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if not rest:
         print("usage: petri scope <run number>")
         return 1
     try:
-        number = int(args[0])
+        number = int(rest[0])
     except ValueError:
         print("error: petri scope: run number must be an integer")
         return 1
@@ -1260,16 +1355,21 @@ def cmd_scope(args):
     if not run:
         print("error: petri scope: no run #{}".format(number))
         return 1
+    if as_json:
+        emit_json(run)
+        return 0
     print_inspect(run)
 
 
 def cmd_gram(args):
-    if len(args) < 2:
-        print("usage: petri gram <run number A> <run number B>")
+    as_json = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if len(rest) < 2:
+        print("usage: petri gram <run number A> <run number B> [--json]")
         return 1
     try:
-        a = int(args[0])
-        b = int(args[1])
+        a = int(rest[0])
+        b = int(rest[1])
     except ValueError:
         print("error: petri gram: run numbers must be integers")
         return 1
@@ -1278,16 +1378,23 @@ def cmd_gram(args):
     if not run_a or not run_b:
         print("error: petri gram: one or both runs not found ({} / {})".format(a, b))
         return 1
+    if as_json:
+        emit_json({"command": "gram",
+                   "culture_a": run_a["number"], "culture_b": run_b["number"],
+                   **build_gram(run_a, run_b)})
+        return 0
     print_compare(run_a, run_b)
 
 
 def cmd_cfu(args):
-    if len(args) < 2:
-        print("usage: petri cfu <run number A> <run number B>")
+    as_json = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if len(rest) < 2:
+        print("usage: petri cfu <run number A> <run number B> [--json]")
         return 1
     try:
-        a = int(args[0])
-        b = int(args[1])
+        a = int(rest[0])
+        b = int(rest[1])
     except ValueError:
         print("error: petri cfu: run numbers must be integers")
         return 1
@@ -1296,6 +1403,9 @@ def cmd_cfu(args):
     if not run_a or not run_b:
         print("error: petri cfu: one or both runs not found ({} / {})".format(a, b))
         return 1
+    if as_json:
+        emit_json(build_cfu_table(run_a, run_b))
+        return 0
     print_cfu(run_a, run_b)
 
 
@@ -1429,10 +1539,10 @@ usage:
   petri agar [status] [path] [export <dest.tar>] [import <arch.tar>]  manage the workspace
   petri culture <program.py> [--well NAME] [--track N] [--ignore N] [--classes]  grow a run
   petri batch <program.py> [--times N] [--well NAME] [--track N] [--ignore N] [--classes]  grow N runs (default 10)
-  petri plate [--well NAME]                     list cultures (filter by well)
-  petri scope <run>                             observe a culture's variable history
-  petri gram <runA> <runB>                      differential test (diff) two cultures
-  petri cfu <runA> <runB>                       numeric change measure per variable
+  petri plate [--well NAME] [--json]        list cultures (filter by well)
+  petri scope <run> [--json]                observe a culture's variable history
+  petri gram <runA> <runB> [--json]         differential test (diff) two cultures
+  petri cfu <runA> <runB> [--json]          numeric change measure per variable
   petri incubate <program.py> <limit-ms>        time a run against a limit (ms)
   petri sterilize                               delete all cultures (confirm twice)
   petri evolve                                  update petri to the latest version
