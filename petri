@@ -25,7 +25,7 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 RUN_SCHEMA = 3
 
 # --- self-update / freshness -------------------------------------------------
@@ -1531,6 +1531,372 @@ def cmd_evolve(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# AI integrations (v0.6) — fully optional. The deterministic engine never
+# depends on any of this; these add natural-language insight on top of the
+# stable --json contract.
+# ---------------------------------------------------------------------------
+
+AI_CONF = os.path.join(DATA_DIR, "ai.json")
+AI_MODEL_DIR = os.path.expanduser("~/.petri/models")
+LOCAL_1B_URL = ("https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/"
+                "smollm2-1.7b-instruct-q4_k_m.gguf?download=true")
+LOCAL_1B_SHORT = "smollm2-1.7b-instruct-q4_k_m.gguf"
+
+
+def _load_ai_conf():
+    conf = {}
+    try:
+        with open(AI_CONF) as fh:
+            conf = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    return conf
+
+
+def _save_ai_conf(conf):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(AI_CONF, "w") as fh:
+        json.dump(conf, fh, indent=2, sort_keys=True)
+
+
+def _ai_configured():
+    conf = _load_ai_conf()
+    if conf.get("opted_out"):
+        return True
+    return bool(conf.get("engine"))
+
+
+# --- runtime detection ------------------------------------------------------
+def detect_runtimes():
+    """Return a list of dicts describing available AI runtimes.
+
+    Each: {'key','label','available','detail'} covering the local engines
+    (ollama, llama.cpp), the python stack (transformers/torch), and provider
+    APIs (always "available" as a fallback — needs a key at use time).
+    """
+    found = []
+
+    ollama = shutil.which("ollama")
+    ollama_models = []
+    if ollama:
+        try:
+            out = subprocess.run([ollama, "list"], capture_output=True, text=True,
+                                 timeout=10)
+            for line in (out.stdout or "").splitlines()[1:]:
+                parts = line.split()
+                if parts:
+                    ollama_models.append(parts[0])
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    found.append({
+        "key": "ollama",
+        "label": "ollama",
+        "available": bool(ollama),
+        "detail": ollama_models,
+    })
+
+    llama = shutil.which("llama-cli") or shutil.which("llama-server")
+    found.append({
+        "key": "llama.cpp",
+        "label": "llama.cpp",
+        "available": bool(llama),
+        "detail": llama or "",
+    })
+
+    try:
+        import torch  # noqa: F401
+        has_torch = True
+    except ImportError:
+        has_torch = False
+    try:
+        import transformers  # noqa: F401
+        has_tf = True
+    except ImportError:
+        has_tf = False
+    found.append({
+        "key": "transformers",
+        "label": "transformers",
+        "available": has_torch and has_tf,
+        "detail": "torch + transformers",
+    })
+
+    found.append({
+        "key": "provider",
+        "label": "provider API",
+        "available": True,
+        "detail": "needs an API key (no download)",
+    })
+    return found
+
+
+# --- gradient progress / UI --------------------------------------------------
+
+def _gradient_lerp(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _gradient_bar(frac, width=24):
+    """Render a pastel gradient progress bar ('' when color is disabled)."""
+    if not _color_enabled():
+        blocks = int(frac * width)
+        return "[" + ("#" * blocks).ljust(width) + "] {:.0f}%".format(frac * 100)
+    out = "["
+    for i in range(width):
+        t = i / float(width - 1)
+        if i / float(width) <= frac:
+            col = _gradient_lerp(_PLATE_COLORS[0], _PLATE_COLORS[3], t)
+            out += _ansi256(col) + "#" + _reset()
+        else:
+            out += " "
+    out += "] {:.0f}%".format(frac * 100)
+    return out
+
+
+def _gradient_banner():
+    if not _color_enabled():
+        return "petri AI"
+    out = ""
+    for t in range(0, 100, 20):
+        t = t / 100.0
+        col = _gradient_lerp(_PLATE_COLORS[0], _PLATE_COLORS[5], t)
+        out += _ansi256(col) + "█" + _reset()
+    return out
+
+
+# --- GGUF downloader (stdlib only, streaming) --------------------------------
+
+def download_1b(progress_cb=None):
+    """Stream-download the default 1B GGUF into ~/.petri/models.
+
+    Uses urllib (stdlib) so v0.6 stays zero-dependency. `progress_cb(frac)` is
+    called with 0..1 as bytes arrive. Returns the local path.
+    """
+    os.makedirs(AI_MODEL_DIR, exist_ok=True)
+    dest = os.path.join(AI_MODEL_DIR, LOCAL_1B_SHORT)
+    if os.path.exists(dest) and os.path.getsize(dest) > 1024 * 1024:
+        return dest
+    tmp = dest + ".part"
+    req = urllib.request.Request(LOCAL_1B_URL, headers={"User-Agent": "petri/{}".format(VERSION)})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        with open(tmp, "wb") as fh:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                got += len(chunk)
+                if progress_cb and total:
+                    progress_cb(got / float(total))
+    os.replace(tmp, dest)
+    return dest
+
+
+# --- inference hooks ---------------------------------------------------------
+
+def _ollama_chat(model, prompt):
+    import json as _j
+    import urllib.request as _ur
+    body = _j.dumps({"model": model, "prompt": prompt, "stream": False}).encode()
+    req = _ur.Request("http://127.0.0.1:11434/api/generate", data=body,
+                      headers={"Content-Type": "application/json"})
+    with _ur.urlopen(req, timeout=300) as r:
+        data = _j.load(r)
+    return (data.get("response") or "").strip()
+
+
+def _provider_chat(key, model, prompt):
+    import json as _j
+    import urllib.request as _ur
+    body = _j.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = _ur.Request("https://api.openai.com/v1/chat/completions", data=body,
+                      headers={"Content-Type": "application/json",
+                               "Authorization": "Bearer {}".format(key)})
+    with _ur.urlopen(req, timeout=300) as r:
+        data = _j.load(r)
+    return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+def _ai_insight(prompt):
+    """Route a prompt to the configured engine and return its text."""
+    conf = _load_ai_conf()
+    engine = conf.get("engine")
+    if engine == "ollama":
+        model = conf.get("model") or "gemma3:1b"
+        return _ollama_chat(model, prompt)
+    if engine == "provider":
+        model = conf.get("model") or "gpt-4o-mini"
+        key = conf.get("api_key")
+        if not key:
+            raise RuntimeError("no API key configured; run 'petri ai' to set it")
+        return _provider_chat(key, model, prompt)
+    raise RuntimeError("no AI engine configured; run 'petri ai'")
+
+
+# --- the wizard --------------------------------------------------------------
+
+def _prompt_choice(prompt):
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return ""
+
+
+def cmd_ai(args):
+    """Configure (or reconfigure) the AI layer. Runs the gradient wizard."""
+    conf = _load_ai_conf()
+    if not args or args[0] != "--force":
+        if _ai_configured() and args[:1] != ["reconfigure"]:
+            print("petri AI is configured (engine: {}, model: {}).".format(
+                conf.get("engine"), conf.get("model") or conf.get("engine")))
+            print("re-run with 'petri ai reconfigure' to change it, or")
+            print("'petri why <a> <b>' / 'petri ask \"...\"' to use it.")
+            return 0
+
+    print(_gradient_banner())
+    print("petri AI — optional natural-language insight over your plate.")
+    print("the core petri engine stays deterministic and AI-optional; this never")
+    print("runs unless you opt in.")
+    print()
+    print("local 1B models are recommended — private, no API key, ~2 GB free")
+    print("RAM/VRAM recommended at runtime.")
+    print()
+
+    if not _color_enabled():
+        print("note: a TTY is best for the gradient chooser.")
+
+    runtimes = detect_runtimes()
+
+    # --- opt out gate ---
+    choice = _prompt_choice("Enable the AI layer? [(y)es / (o)pt-out]: ")
+    if choice.lower().startswith("o"):
+        conf["opted_out"] = True
+        conf.pop("engine", None)
+        _save_ai_conf(conf)
+        print("opted out. run 'petri ai reconfigure' to enable later.")
+        return 0
+    conf.pop("opted_out", None)
+
+    # --- engine selection (gradient list) ---
+    print()
+    print("available engines:")
+    for idx, rt in enumerate(runtimes, 1):
+        mark = "✓" if rt["available"] else " "
+        print("  {}  {} {}".format(mark, rt["label"], rt["key"]))
+        detail = rt["detail"]
+        if isinstance(detail, list) and detail:
+            print("        models: {}".format(", ".join(detail[:6])))
+        elif detail:
+            print("        {}".format(detail))
+    print("      (l)ocal 1B download — fetch a fresh model via gradIent bar")
+    print()
+    eng_choice = _prompt_choice("pick an engine [1/2/3/4 or 'l'ocal]: ").lower()
+
+    if eng_choice == "l":
+        # gradient download
+        print()
+        print("downloading {} ...".format(LOCAL_1B_SHORT))
+        try:
+            path = download_1b(progress_cb=lambda f: print(
+                "\r  " + _gradient_bar(f), end="", flush=True))
+            print()
+            conf["engine"] = "llama.cpp"
+            conf["model"] = path
+        except Exception as e:
+            print("\nerror downloading model: {}".format(e))
+            print("fall back to another engine, or reconnect and retry.")
+            return 1
+    else:
+        try:
+            rt = runtimes[int(eng_choice) - 1]
+        except (ValueError, IndexError):
+            print("invalid choice; aborting.")
+            return 1
+        if not rt["available"]:
+            print("error: {} is not installed on this machine.".format(rt["label"]))
+            return 1
+        conf["engine"] = rt["key"]
+        if rt["key"] == "ollama":
+            if isinstance(rt["detail"], list) and rt["detail"]:
+                conf["model"] = rt["detail"][0]
+            else:
+                conf["model"] = "gemma3:1b"
+        if rt["key"] == "provider":
+            key = _prompt_choice("  API key: ")
+            conf["api_key"] = key
+            model = _prompt_choice("  model [gpt-4o-mini]: ") or "gpt-4o-mini"
+            conf["model"] = model
+
+    _save_ai_conf(conf)
+    print()
+    print("petri AI is on (engine: {}, model: {}).".format(
+        conf.get("engine"), conf.get("model")))
+    print("try: petri why <runA> <runB>   or   petri ask \"<question>\"")
+    return 0
+
+
+def cmd_why(args):
+    rest = [a for a in args if a != "--json"]
+    if len(rest) < 2:
+        print("usage: petri why <run A> <run B>")
+        return 1
+    try:
+        a, b = int(rest[0]), int(rest[1])
+    except ValueError:
+        print("error: petri why: run numbers must be integers")
+        return 1
+    run_a, run_b = load_run(a), load_run(b)
+    if not run_a or not run_b:
+        print("error: petri why: one or both runs not found ({} / {})".format(a, b))
+        return 1
+    if not _ai_configured():
+        print("petri AI is not set up. run:  petri ai")
+        return 1
+
+    gram = json.dumps(build_gram(run_a, run_b), indent=2, ensure_ascii=False)
+    cfu = json.dumps(build_cfu_table(run_a, run_b), indent=2, ensure_ascii=False)
+    prompt = (
+        "You are helping a developer understand what changed between two Python "
+        "experiments captured by 'petri'.\n\n"
+        "GRAM (changed values):\n{}\n\nCFU (numeric metrics):\n{}\n\n"
+        "Give a concise plain-English explanation of the most important "
+        "changes, likely cause, and any risk. Do not invent data.".format(gram, cfu))
+    try:
+        text = _ai_insight(prompt)
+    except Exception as e:
+        print("AI error: {}".format(e))
+        return 1
+    if args[-1:] == ["--json"]:
+        import json as _j
+        print(_j.dumps({"culture_a": a, "culture_b": b, "insight": text},
+                       ensure_ascii=False))
+    else:
+        print(text)
+    return 0
+
+
+def cmd_ask(args):
+    if not args:
+        print("usage: petri ask \"<question>\"")
+        return 1
+    question = args[0]
+    if not _ai_configured():
+        print("petri AI is not set up. run:  petri ai")
+        return 1
+    try:
+        text = _ai_insight(question)
+    except Exception as e:
+        print("AI error: {}".format(e))
+        return 1
+    print(text)
+    return 0
+
+
 def main(argv):
     if not argv:
         print("""petri - grow, observe, compare (v{version})
@@ -1546,6 +1912,9 @@ usage:
   petri incubate <program.py> <limit-ms>        time a run against a limit (ms)
   petri sterilize                               delete all cultures (confirm twice)
   petri evolve                                  update petri to the latest version
+  petri ai [reconfigure]                        set up the optional AI layer (gradient wizard)
+  petri why <runA> <runB>                       AI plain-English explanation of a gram/cfu
+  petri ask "<question>"                        ask the AI about your plate
   petri --version                               print version
 
 help:
@@ -1585,6 +1954,12 @@ help:
         return cmd_cfu(rest)
     if cmd == "sterilize":
         return cmd_sterilize(rest)
+    if cmd in ("ai",):
+        return cmd_ai(rest)
+    if cmd == "why":
+        return cmd_why(rest)
+    if cmd == "ask":
+        return cmd_ask(rest)
     if cmd == "incubate":
         return cmd_incubate(rest)
 

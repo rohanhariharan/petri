@@ -59,7 +59,14 @@ petri cfu 2 3 --json                     # machine-readable cfu
 petri incubate main.py 500               # time a run against a 500 ms limit
 petri sterilize                          # delete all cultures (confirm twice)
 petri evolve                             # update petri to the latest version
+petri ai                                 # set up the optional AI layer (gradient wizard)
+petri why 2 3                          # AI plain-English explanation of a gram/cfu
+petri ask "why is x drifting?"           # ask the AI about your plate
 ```
+
+`petri` instruments a Python program and records its variable history. The
+**AI layer is fully optional** — the core engine stays deterministic and
+zero-dependency; nothing runs a model unless you opt in via `petri ai`.
 
 `petri agar` is the lab's substrate — the workspace every culture grows on. Use
 it to check lab status, find the storage path, and bundle or restore your
@@ -181,8 +188,30 @@ recorder appends each change to a JSONL log the instant it happens — so even a
 hard `os._exit()` leaves the captured state on disk. Runs are saved under
 `~/.petri/runs/` as JSON.
 
+## The AI layer (optional)
+
+`petri ai` runs a pastel gradient setup wizard once; your choice is saved to
+`~/.petri/ai.json` and never re-prompted. It:
+
+- warns about the ~2 GB free RAM/VRAM that a local 1B model wants;
+- **detects what's already installed** (ollama, llama.cpp, transformers) and
+  their available models;
+- lets you choose an engine:
+  - a **local 1B model download** (a tiny streaming GGUF, shown on a gradient
+    progress bar),
+  - an **installed runtime** (e.g. an existing ollama model), or
+  - a **provider API** (OpenAI-compatible, no download), or
+  - **opt out** entirely.
+
+Once set up, `petri why <a> <b>` explains a `gram`/`cfu` in plain English, and
+`petri ask "<question>"` answers about your plate. Both consume the stable
+`--json` output, keeping the deterministic engine independent of the model.
+Reconfigure any time with `petri ai reconfigure`.
+
 ## Known limitations
 
+- The AI layer only works with an installed engine, a provider key, or a
+  downloaded local model (via `petri ai`); it's entirely optional.
 - Attributes are off by default; pass `--classes` to record them.
 - numpy `ndarray`s are only snapshotted if the program imports numpy (zero-dependency: petri never imports it itself).
 - Function locals are only captured when the function actually runs (it's real
