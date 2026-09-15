@@ -25,7 +25,7 @@ DATA_DIR = os.path.expanduser("~/.petri")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 # --- self-update / freshness -------------------------------------------------
 REPO = "rohanhariharan/petri"
@@ -76,6 +76,29 @@ def latest_version():
         return None
 
 
+def latest_release_notes():
+    """Return (version, body) of the newest release, or (None, None)."""
+    try:
+        with urllib.request.urlopen(API_RELEASES_URL, timeout=4) as r:
+            data = json.load(r)
+        return (data.get("tag_name") or data.get("name")) or None, \
+               data.get("body") or None
+    except Exception:
+        return None, None
+
+
+def _strip_notes_trailer(body):
+    """Strip common noise (like the 'Commands' dump) from release notes."""
+    if not body:
+        return ""
+    # cut at a few noisy markers if present
+    for marker in ("## Commands", "# Commands", "## Command", "Usage:"):
+        i = body.find(marker)
+        if i != -1:
+            body = body[:i]
+    return body.strip()
+
+
 def check_for_update(silent=False):
     """Warn (once per command) if a newer version of petri exists."""
     latest = latest_version()
@@ -87,6 +110,28 @@ def check_for_update(silent=False):
               file=sys.stderr)
         return True
     return False
+
+
+def _version_update_hint():
+    """On `petri --version`, show a friendly update warning + new features."""
+    latest, body = latest_release_notes()
+    if not latest:
+        return
+    if _parse_version(latest) <= _parse_version(VERSION):
+        return
+    print("")
+    print("an update is available: petri {} → {}".format(VERSION, latest))
+    print("run 'petri evolve' to get it.")
+    notes = _strip_notes_trailer(body)
+    if notes:
+        print("what's new in {}:".format(latest))
+        for line in notes.splitlines():
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith(("# ", "## ")):
+                continue
+            print("  " + line)
 
 # ---------------------------------------------------------------------------
 # Value serialization
@@ -1277,6 +1322,9 @@ help:
 
     if cmd in ("--version", "-V", "version"):
         print("petri {}".format(VERSION))
+        # if a newer release exists, surface the update warning + what's new
+        if not os.environ.get("PETRI_NO_UPDATE"):
+            _version_update_hint()
         return 0
 
     if cmd == "help":
